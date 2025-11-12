@@ -1,0 +1,18 @@
+# ...
+.env
+
+# [신규] SQLite 데이터베이스 파일
+*.sqlite
+*.sqlite-journal
+*.db
+*.db-journal
+
+# (기존)
+venv/
+__pycache__/
+*.pth
+*.pkl
+
+# csv, data
+data/
+*.csv
