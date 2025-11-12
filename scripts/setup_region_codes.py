@@ -10,15 +10,18 @@ project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.append(project_root)
 from app.core.config import engine
 
+# 특정 시군구 코드 수집을 위한 배열
+TARGET_SGG_CODES = [
+    '28237'
+    # (나중에 서울 강서구 '11500' 등을 이곳에 추가)
+]
+
 # --- 설정 ---
 # 1. 원본 법정동 코드 CSV 파일 경로
 CSV_PATH = os.path.join(project_root, 'data', '국토교통부_법정동코드_20250805.csv')
 
 TABLE_SGG = "meta_sgg_codes"  # 1. 시군구 단위 테이블 (매매, 전월세용)
 TABLE_BJDONG = "meta_bjdong_codes" # 2. 법정동 단위 테이블 (건축물대장용)
-
-# 2. 저장할 DB 테이블 이름
-TABLE_NAME = "meta_region_codes"
 
 # 수집 시작 날짜를 '201501'이 아닌, '현재 달의 다음 달'로 설정
 # 예: 2025년 10월 -> '202511'로 설정.
@@ -56,13 +59,15 @@ def setup_region_database():
     df_active['bjdong_name'] = df_active['name']  # (법정동 이름)
 
     # --- 3-A. [시군구] 테이블 데이터 생성 (매매, 전월세용) ---
+    print(f"--- 3. 목표 지역 필터링: {TARGET_SGG_CODES} ---")
+    # 특정 시군구 코드만 수집하도록 필터링
+    df_active = df_active[df_active['sgg_code'].isin(TARGET_SGG_CODES)].copy()
 
     # 1. '시군구' 레벨 코드(e.g., 11000) 제외
     is_sigungu_code = ~df_active['sgg_code'].str.endswith('000')
 
     # 2. '시군구' 코드 기준으로 중복 제거
     df_sgg_final = df_active[is_sigungu_code][['sgg_code']].drop_duplicates().copy()
-
     # 3. 수집 상태 컬럼 추가
     df_sgg_final['trade_last_fetched_date'] = DEFAULT_START_DATE
     df_sgg_final['rent_last_fetched_date'] = DEFAULT_START_DATE
@@ -73,12 +78,9 @@ def setup_region_database():
 
     # 1. '읍면동' 레벨 코드만 필터링 (시/도 '...00000000' 및 시/군/구 '...00000' 제외)
     is_dong_level = ~df_active['code'].str.endswith('00000')
-
     df_bjdong_final = df_active[is_dong_level][['sgg_code', 'bjdong_code', 'bjdong_name']].drop_duplicates().copy()
-
     # 2. 수집 상태 컬럼 추가
     df_bjdong_final['ledger_last_fetched_date'] = DEFAULT_START_DATE
-
     print(f"총 {len(df_bjdong_final)}개의 *법정동* 코드(e.g., 11680-10300)를 추출했습니다.")
 
     # --- 4. DB에 두 개의 테이블 저장 ---
