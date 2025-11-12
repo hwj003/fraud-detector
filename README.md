@@ -1,4 +1,5 @@
-### api 엔드포인트
+# 전세사기 예측 모델 
+### API 엔드포인트
 /predict - post 
 ### 입력 파라미터 (json body)
 jeonse_ratio: 전세가율 (0.0~1.0 사이의 값) \
@@ -29,8 +30,8 @@ loan_plus_jeonse_ratio: 부채+전세가율(선순위 부채와 전세 보증금
 ##### 국토교통부_오피스텔 매매 실거래가 자료 https://www.data.go.kr/data/15126464/openapi.do
 ##### 국토교통부_연립다세대 전월세 실거래가 자료 https://www.data.go.kr/data/15126473/openapi.do
 ##### 국토교통부_연립다세대 매매 실거래가 자료 https://www.data.go.kr/data/15126467/openapi.do
-##### 국토교통부_아파트 매매 실거래가 자료 \ https://www.data.go.kr/data/15126469/openapi.do
-##### 국토교통부_아파트 전월세 실거래가 자료 \ https://www.data.go.kr/data/15126474/openapi.do
+##### 국토교통부_아파트 매매 실거래가 자료 https://www.data.go.kr/data/15126469/openapi.do
+##### 국토교통부_아파트 전월세 실거래가 자료 https://www.data.go.kr/data/15126474/openapi.do
 ##### 국토교통부_건축HUB_건축물대장정보 서비스 https://www.data.go.kr/data/15134735/openapi.do
 
 
