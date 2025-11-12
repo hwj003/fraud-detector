@@ -1,9 +1,0 @@
-jeonse_ratio
-loan_plus_jeonse_ratio
-has_trust
-is_illegal_building
-owner_changed_recently
-building_use_아파트
-building_use_다세대주택
-building_use_오피스텔
-building_use_근린생활시설
