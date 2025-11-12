@@ -1,9 +1,14 @@
-# fraud_detector_project/requirements.txt
-
 fastapi
 uvicorn[standard]
 torch
-snorkel
 pandas
+numpy
 scikit-learn
-joblib # (scaler.pkl 저장/로드를 위해 scikit-learn과 함께 권장됨)
+joblib
+snorkel
+SQLAlchemy
+mysql-connector-python
+requests
+python-dotenv
+python-dateutil
+pytest
