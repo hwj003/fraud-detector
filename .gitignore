@@ -8,7 +8,7 @@
 *.db-journal
 
 # (기존)
-venv/
+.venv/
 __pycache__/
 *.pth
 *.pkl
