@@ -12,6 +12,7 @@
 __pycache__/
 *.pth
 *.pkl
+.idea/
 
 # csv, data
 data/
