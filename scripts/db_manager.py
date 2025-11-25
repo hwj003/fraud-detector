@@ -21,55 +21,96 @@ def init_db():
     conn = get_connection()
     cur = conn.cursor()
 
-    # ---------------------------------------------------------
-    # 1. 작업 로그 테이블 (API 호출 상태 기록)
-    # ---------------------------------------------------------
+    # !주의: 테이블 초기화
+    # cur.execute("DROP TABLE IF EXISTS api_job_log")
+    # cur.execute("DROP TABLE IF EXISTS public_price_history")
+    # cur.execute("DROP TABLE IF EXISTS building_info")
+
+    """
+    테이블 명: building_info
+    테이블 구조
+    unique_number: 고유번호(2823710100...) - API 연동시 Key
+    building_id_code: 건물ID(222004...)
+    
+    road_address: 도로명 주소
+    lot_address: 지번주소
+    detail_address: 상세주소 (101동 302호)
+    
+    exclusive_area: 전용면적
+    main_use: 주용도
+    structure_type: 구조(철근콘크리트 등)
+    
+    owner_name: 소유자명
+    ownership_changed_date: 소유권 변동일 (최근 변경 시 위험 경고용)
+    ownership_cause: 변동원인(매매/증여/신탁 등 - 신탁일 경우 위험)
+    is_violating_building: 위반건축물 여부 (Y/N)
+    """
     cur.execute('''
-            CREATE TABLE IF NOT EXISTS api_job_log (
-                search_address TEXT PRIMARY KEY,  -- 검색한 주소
-                status TEXT,                      -- 성공/실패/보류 상태
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
+        CREATE TABLE IF NOT EXISTS building_info (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+            unique_number VARCHAR(50) NOT NULL UNIQUE,
+            building_id_code VARCHAR(50),
+
+            road_address VARCHAR(255) NOT NULL,
+            lot_address VARCHAR(255),
+            detail_address VARCHAR(100),
+
+            exclusive_area DECIMAL(10, 2) NOT NULL,
+            main_use VARCHAR(50) NOT NULL,
+            structure_type VARCHAR(50),
+
+            owner_name VARCHAR(100),
+            ownership_changed_date DATE,
+            ownership_cause VARCHAR(50),
+            is_violating_building CHAR(1) DEFAULT 'N',
+
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    ''')
 
     # ---------------------------------------------------------
-    # 2. 일반건축물 테이블 (General Buildings)
-    # 대상: 다가구, 단독주택, 상가 (건물주가 1명인 경우)
+    # 2. updated_at 자동 갱신을 위한 Trigger 생성
     # ---------------------------------------------------------
     cur.execute('''
-            CREATE TABLE IF NOT EXISTS general_buildings (
-                unique_no TEXT PRIMARY KEY,       -- 고유번호
-                road_addr TEXT,                   -- 도로명주소
-                lot_addr TEXT,                    -- 지번주소
-                owner_name TEXT,                  -- 소유자명 (건물 전체 주인)
-                main_usage TEXT,                  -- 주용도
-                total_area REAL,                  -- 연면적
-                violation_details TEXT,           -- 위반건축물 내역
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
+        CREATE TRIGGER IF NOT EXISTS update_building_info_modtime 
+        AFTER UPDATE ON building_info
+        BEGIN
+            UPDATE building_info 
+            SET updated_at = CURRENT_TIMESTAMP 
+            WHERE id = OLD.id;
+        END;
+    ''')
 
-    # ---------------------------------------------------------
-    # 3. 집합건축물 전유부 테이블 (Collective Units)
-    # 대상: 아파트, 빌라, 오피스텔 (호수별로 주인이 다름)
-    # 핵심: (고유번호 + 동 + 호)가 합쳐져야 유일한 키가 됨
-    # ---------------------------------------------------------
+    """
+    테이블 명: public_price_history 
+    테이블 구조
+    building_info_id: FK
+    base_date: 기준일
+    price:  공시가격 (원 단위)
+    created_at: 생성일
+    """
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS public_price_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        building_info_id INTEGER NOT NULL,
+        base_date DATE NOT NULL,
+        price DECIMAL(15, 0) NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (building_info_id) REFERENCES building_info(id) ON DELETE CASCADE
+    );
+    ''')
+
     cur.execute('''
-            CREATE TABLE IF NOT EXISTS collective_units (
-                unique_no TEXT,                   -- 고유번호 (단지 식별용)
-                dong_nm TEXT,                     -- 동 (예: 101동)
-                ho_nm TEXT,                       -- 호 (예: 502호)
-                road_addr TEXT,                   -- 도로명주소
-                owner_name TEXT,                  -- 소유자명 (해당 호수의 주인)
-                exclusive_area REAL,              -- 전용면적 (가장 중요)
-                violation_details TEXT,           -- 위반 내역
-                total_area REAL,                  -- 공급면적(참고용)
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-
-                -- [중요] 복합 기본키 설정 (이 3개가 같으면 중복 데이터로 간주)
-                PRIMARY KEY (unique_no, dong_nm, ho_nm)
-            )
-        ''')
+        CREATE TABLE IF NOT EXISTS api_job_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            search_address VARCHAR(255) UNIQUE, -- 중복 수집 방지
+            status VARCHAR(50),                 -- 작업 상태 (DETAIL_SAVED 등)
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    ''')
 
     conn.commit()
     conn.close()
