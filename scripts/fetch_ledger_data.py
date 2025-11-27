@@ -7,7 +7,7 @@ import sqlite3
 import urllib.parse
 import base64
 from db_manager import init_db, get_connection
-from kakao_localmap_api import get_road_address_from_kakao
+from kakao_localmap_api import get_building_name_from_kakao
 load_dotenv()
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -551,9 +551,10 @@ def collect_apartment_complex(token, start_address):
     print(f"\n===============================================================")
     print(f"[Start] 표본 수집 시작: {start_address}")
     print(f"===============================================================")
-
+    building_name = get_building_name_from_kakao(start_address)
+    target_address = f"{start_address} {building_name}"
     # 1. 동(Dong) 목록 확보
-    dong_list, res_data = get_dong_list_step(token, start_address)
+    dong_list, res_data = get_dong_list_step(token, target_address)
 
     if not dong_list:
         # res_data가 있으면 API 코드를, 없으면 일반 에러 메시지 저장
@@ -565,7 +566,7 @@ def collect_apartment_complex(token, start_address):
         else:
             print("   [Fail] 동 목록 없음 (응답 없음)")
 
-        # 🔥 실패 로그 저장 (다음에 조회 안 되게 함)
+        # 실패 로그 저장 (다음에 조회 안 되게 함)
         save_job_log(start_address, status=error_code)
         return
 
@@ -590,7 +591,7 @@ def collect_apartment_complex(token, start_address):
     print(f"   [Selected Dong] 표본 동 선택: '{dong_name}' (리스트의 {mid_idx + 1}번째)")
 
     # 2. 해당 동의 호(Ho) 목록 확보
-    ho_list = get_ho_list_step(token, start_address, dong_code)
+    ho_list = get_ho_list_step(token, target_address, dong_code)
 
     if not ho_list:
         print(f"      [Fail] 호 목록을 가져올 수 없습니다.")
@@ -609,7 +610,7 @@ def collect_apartment_complex(token, start_address):
         ho_code = ho['commHoNum']
 
         # [핵심] 실제 API 호출
-        final_res = fetch_final_data_step(token, start_address, dong_code, ho_code)
+        final_res = fetch_final_data_step(token, target_address, dong_code, ho_code)
 
         if final_res and final_res['result']['code'] == 'CF-00000':
             # DB 저장 함수 호출 (기존 코드 사용)
@@ -721,8 +722,6 @@ if __name__ == "__main__":
             print("모든 데이터가 최신이거나, 수집할 대상이 없습니다.")
 
         for idx, target_addr in enumerate(target_list):
-            # 다른 주소 임시로 수집
-            if idx < 50: continue
             print(f"\n===============================================================")
             print(f"[진행률 {idx + 1}/{len(target_list)}] Target: {target_addr}")
             print(f"===============================================================")
