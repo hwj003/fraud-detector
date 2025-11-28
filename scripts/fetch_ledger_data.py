@@ -16,8 +16,8 @@ DB_PATH = os.path.abspath(os.path.join(BASE_DIR, '..', 'local_fraud_db.sqlite'))
 # ==========================================
 # 1. 설정 (Configuration)
 # ==========================================
-CLIENT_ID = os.getenv("CLIENT_ID")
-CLIENT_SECRET = os.getenv("CLIENT_SECRET")
+CLIENT_ID = os.getenv("CLIENT_ID_1")
+CLIENT_SECRET = os.getenv("CLIENT_SECRET_1")
 
 # API 엔드포인트
 TOKEN_URL = "https://oauth.codef.io/oauth/token"
@@ -161,8 +161,8 @@ def fetch_initial_search(token, address):
     payload = {
         "organization": "0008",
         "loginType": "1",
-        "id": os.getenv("CODEF_USER_ID"),
-        "password": os.getenv("CODEF_USER_RSA_PASSWORD"),
+        "id": os.getenv("CODEF_USER_ID_1"),
+        "password": os.getenv("CODEF_USER_RSA_PASSWORD_1"),
         "address": address,
         "dong": ""
     }
@@ -174,8 +174,8 @@ def fetch_next_step(token, jti, jobIndex, twoWayTimestamp, threadIndex, dong_num
     payload = {
         "organization": "0008",
         "loginType": "1",
-        "id": os.getenv("CODEF_USER_ID"),
-        "password": os.getenv("CODEF_USER_RSA_PASSWORD"),
+        "id": os.getenv("CODEF_USER_ID_1"),
+        "password": os.getenv("CODEF_USER_RSA_PASSWORD_1"),
         "is2Way": True,
         "twoWayInfo": {
             "jobIndex": jobIndex,
@@ -196,7 +196,9 @@ def fetch_next_step(token, jti, jobIndex, twoWayTimestamp, threadIndex, dong_num
 # ==========================================
 def parse_and_save(api_json, dong_name, ho_name):
     """
-    [수정 버전] 안정성 강화: SELECT First -> Update/Insert Strategy
+    1. 전유부(resType='0') 데이터로 건물 정보 파싱
+    2. 소유자(resOwnerList) 데이터 파싱 (이름, 변동일, 원인)
+    3. DB 저장 (중복 방지 및 가격 정보 동기화)
     """
     data = api_json.get('data', {})
     if not data:
@@ -204,77 +206,65 @@ def parse_and_save(api_json, dong_name, ho_name):
         return
 
     # ---------------------------------------------------------
-    # 1. 데이터 파싱
+    # 1. 건물 기본 정보 파싱 (전유부 찾기)
     # ---------------------------------------------------------
-
-    # (핵심 수정 1) unique_no 중복 방지
-    # API가 단지 전체에 같은 번호를 줄 경우를 대비해 호수를 붙임
     origin_unique_no = data.get('commUniqeNo', '')
     unique_no = f"{origin_unique_no}-{ho_name}" if origin_unique_no else None
 
     building_id_code = data.get('resDocNo')
-    road_addr = urllib.parse.unquote_plus(data.get('commAddrRoadName', ''))
-    lot_addr = data.get('commAddrLotNumber', '')
-
-    # 상세주소 (식별자)
+    road_addr = urllib.parse.unquote_plus(data.get('commAddrRoadName', '') or '')
+    lot_addr = data.get('commAddrLotNumber', '') or ''
     detail_addr = f"{dong_name} {ho_name}"
-
     is_violating = 'Y' if data.get('resViolationStatus') else 'N'
 
+    # [핵심] resType이 '0'(전유부분)인 항목 찾기
     exclusive_area = 0.0
     main_use = "알수없음"
     structure_type = "알수없음"
 
-    # 임시 변수 (전유부분에서 못 찾을 경우를 대비한 백업용)
-    fallback_structure = ""
-
+    target_item = None
     for item in data.get('resOwnedList', []):
-        # API에서 오는 값 디코딩
-        res_type = item.get('resType')  # 0: 전유, 1: 공용
-        res_type1 = item.get('resType1')  # 주: 주건물, 부: 부속
+        if item.get('resType') == '0':
+            target_item = item
+            break
 
-        raw_str = urllib.parse.unquote_plus(item.get('resStructure', '') or '')
-        raw_use = urllib.parse.unquote_plus(item.get('resUseType', '') or '')
-        raw_area = float(item.get('resArea', 0))
+    if target_item:
+        main_use = urllib.parse.unquote_plus(target_item.get('resUseType', '') or '')
+        structure_type = urllib.parse.unquote_plus(target_item.get('resStructure', '') or '')
+        exclusive_area = float(target_item.get('resArea', 0))
 
-        # 1. 구조 정보 백업 (어디서든 구조 정보가 나오면 일단 저장해둠)
-        if raw_str and not fallback_structure:
-            fallback_structure = raw_str
+    # 구조 정보 누락 대비 안전장치 (공용부에서라도 구조 가져오기)
+    if not structure_type or structure_type == "알수없음":
+        for item in data.get('resOwnedList', []):
+            temp_str = urllib.parse.unquote_plus(item.get('resStructure', '') or '')
+            if temp_str:
+                structure_type = temp_str
+                break
 
-        # 2. 전유부분(주거 공간) 타겟팅
-        if res_type == '0' or res_type1 == '주':
-            # 면적이나 용도가 있는 '진짜' 전유부분 행을 찾음
-            # (가끔 전유부분인데 면적 0인 더미 데이터가 있을 수 있음)
-            if raw_area > 0:
-                exclusive_area = raw_area
-                main_use = raw_use
-
-                # 구조가 있으면 바로 채택
-                if raw_str:
-                    structure_type = raw_str
-
-        # 반복문이 끝난 후, 만약 전유부분에서 구조를 못 찾았다면 백업해둔 값(공용부분 등) 사용
-    if not structure_type and fallback_structure:
-        structure_type = fallback_structure
-
-        # 여전히 없으면 '알수없음' 혹은 빈 문자열
-    if not structure_type:
-        structure_type = "알수없음"
-
+    # ---------------------------------------------------------
+    # 2. 소유자 정보 파싱 (질문하신 부분)
+    # ---------------------------------------------------------
     owner_nm = ""
     ownership_date = None
     ownership_cause = ""
 
+    # 소유자 리스트가 존재하면 첫 번째 사람(현 소유자) 정보를 가져옴
     if data.get('resOwnerList'):
-        owner_info = data['resOwnerList'][0]
-        owner_nm = urllib.parse.unquote_plus(owner_info.get('resOwner', ''))
-        raw_date = owner_info.get('resChangeDate', '')
+        current_owner = data['resOwnerList'][0]
+
+        # 1. 소유자명 디코딩
+        owner_nm = urllib.parse.unquote_plus(current_owner.get('resOwner', '') or '')
+
+        # 2. 변동일자 (YYYYMMDD -> YYYY-MM-DD 변환)
+        raw_date = current_owner.get('resChangeDate', '')
         if len(raw_date) == 8:
             ownership_date = f"{raw_date[:4]}-{raw_date[4:6]}-{raw_date[6:]}"
-        ownership_cause = urllib.parse.unquote_plus(owner_info.get('resChangeReason', ''))
+
+        # 3. 변동원인 (매매, 소유권이전 등)
+        ownership_cause = urllib.parse.unquote_plus(current_owner.get('resChangeReason', '') or '')
 
     # ---------------------------------------------------------
-    # 2. DB 저장 (로직 변경됨)
+    # 3. DB 저장 트랜잭션
     # ---------------------------------------------------------
     conn = get_connection()
     cur = conn.cursor()
@@ -282,7 +272,7 @@ def parse_and_save(api_json, dong_name, ho_name):
     try:
         building_id = None
 
-        # (Step 1) 먼저 해당 주소로 등록된 건물이 있는지 확인 (SELECT)
+        # Step 1: 건물 정보 저장 (Insert or Update)
         cur.execute("""
             SELECT id FROM building_info 
             WHERE road_address = ? AND detail_address = ?
@@ -291,7 +281,7 @@ def parse_and_save(api_json, dong_name, ho_name):
         row = cur.fetchone()
 
         if row:
-            # A. 이미 존재함 -> ID 확보 및 정보 업데이트 (UPDATE)
+            # Update
             building_id = row[0]
             cur.execute("""
                 UPDATE building_info 
@@ -306,8 +296,7 @@ def parse_and_save(api_json, dong_name, ho_name):
                 building_id
             ))
         else:
-            # B. 없음 -> 신규 저장 (INSERT)
-            # OR IGNORE를 제거하여 진짜 에러(Constraints)를 확인하도록 함
+            # Insert
             cur.execute("""
                 INSERT INTO building_info (
                     unique_number, building_id_code, road_address, lot_address, detail_address,
@@ -319,9 +308,9 @@ def parse_and_save(api_json, dong_name, ho_name):
                 exclusive_area, main_use, structure_type,
                 owner_nm, ownership_date, ownership_cause, is_violating
             ))
-            building_id = cur.lastrowid  # 방금 생성된 ID 가져오기
+            building_id = cur.lastrowid
 
-        # (Step 2) 가격 정보 저장 (Sync)
+        # Step 2: 가격 정보 저장
         if building_id:
             cur.execute("DELETE FROM public_price_history WHERE building_info_id = ?", (building_id,))
 
@@ -330,11 +319,11 @@ def parse_and_save(api_json, dong_name, ho_name):
 
             for price_item in price_list:
                 raw_price = price_item.get('resBasePrice', '0').replace(',', '')
-                raw_date = price_item.get('resReferenceDate', '')
-                fmt_date = f"{raw_date[:4]}-{raw_date[4:6]}-{raw_date[6:]}" if len(raw_date) == 8 else raw_date
+                raw_price_date = price_item.get('resReferenceDate', '')
+                fmt_price_date = f"{raw_price_date[:4]}-{raw_price_date[4:6]}-{raw_price_date[6:]}" if len(
+                    raw_price_date) == 8 else raw_price_date
 
-                # executemany를 위한 튜플 리스트 생성
-                insert_data.append((building_id, fmt_date, raw_price))
+                insert_data.append((building_id, fmt_price_date, raw_price))
 
             if insert_data:
                 cur.executemany("""
@@ -343,17 +332,16 @@ def parse_and_save(api_json, dong_name, ho_name):
                 """, insert_data)
 
             conn.commit()
-            print(f"      [Saved] {dong_name} {ho_name} (ID: {building_id}, 가격정보 {len(price_list)}건)")
+            print(f"      [Saved] {dong_name} {ho_name} (ID: {building_id}, 주인: {owner_nm})")
         else:
-            print(f"      [Error] ID 확보 실패: {dong_name} {ho_name}")
+            print(f"      [Error] ID 확보 실패")
 
     except sqlite3.IntegrityError as e:
         conn.rollback()
-        # 여기서 'UNIQUE constraint failed'가 뜨면 스키마 문제인지 명확히 알 수 있음
-        print(f"      [DB Error] 중복 데이터/제약조건 오류: {e}")
+        print(f"      [DB Error] {e}")
     except Exception as e:
         conn.rollback()
-        print(f"      [Error] 알 수 없는 오류: {e}")
+        print(f"      [Error] {e}")
     finally:
         conn.close()
 
@@ -546,7 +534,7 @@ def select_sample_targets(ho_list):
 # ==========================================
 def collect_apartment_complex(token, start_address):
     """
-    [수정] 단지 내 '중간 동' 선택 로그 및 '저/중/고층' 표본 수집 (이모지 제거)
+    단지 내 '중간 동' 선택 로그 및 '저/중/고층' 표본 수집
     """
     print(f"\n===============================================================")
     print(f"[Start] 표본 수집 시작: {start_address}")
@@ -672,7 +660,13 @@ def get_targets_from_rent_db(limit=100):
         JOIN meta_bjdong_codes m 
           ON r.시군구 = m.sgg_code AND r.법정동 = m.bjdong_code
         LEFT JOIN api_job_log log 
-          ON (m.bjdong_name || ' ' || CAST(r.본번 AS INTEGER) || '-' || CAST(r.부번 AS INTEGER)) = log.search_address
+          ON (
+              m.bjdong_name || ' ' || CAST(r.본번 AS INTEGER) || 
+              CASE 
+                  WHEN CAST(r.부번 AS INTEGER) = 0 THEN '' 
+                  ELSE '-' || CAST(r.부번 AS INTEGER) 
+              END
+          ) = log.search_address
         WHERE log.search_address IS NULL
         LIMIT ?
         """
