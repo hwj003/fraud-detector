@@ -4,7 +4,7 @@ import requests, pandas as pd, xml.etree.ElementTree as ET
 import os, sys, time
 from datetime import datetime
 from sqlalchemy import text
-from functools import lru_cache  # [신규] CSV 캐싱용
+from functools import lru_cache
 
 # --- 프로젝트 경로 및 엔진 ---
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -14,10 +14,12 @@ from app.core.config import engine, load_dotenv
 # --- 환경 변수 및 상수 ---
 load_dotenv()
 API_SERVICE_KEY = os.getenv("API_SERVICE_KEY")
+
+# [핵심] Key 값을 한글로 매핑하여 DB에 저장할 예정
 API_URLS_RENT = {
-    "APT": "https://apis.data.go.kr/1613000/RTMSDataSvcAptRent/getRTMSDataSvcAptRent",
-    "RH": "https://apis.data.go.kr/1613000/RTMSDataSvcRHRent/getRTMSDataSvcRHRent", # 연립다세대
-    "OFFI": "https://apis.data.go.kr/1613000/RTMSDataSvcOffiRent/getRTMSDataSvcOffiRent" # 오피스텔
+    "아파트": "https://apis.data.go.kr/1613000/RTMSDataSvcAptRent/getRTMSDataSvcAptRent",
+    "연립다세대": "https://apis.data.go.kr/1613000/RTMSDataSvcRHRent/getRTMSDataSvcRHRent",
+    "오피스텔": "https://apis.data.go.kr/1613000/RTMSDataSvcOffiRent/getRTMSDataSvcOffiRent"
 }
 RENT_TABLE_NAME = "raw_rent"
 REGION_TABLE_NAME = "meta_sgg_codes"
@@ -28,10 +30,10 @@ API_CALL_LIMIT_PER_RUN = 9900
 SLEEP_TIME_BETWEEN_CALLS = 0.5
 
 
-# --- [신규] 헬퍼: 법정동 코드(CSV) 로드 및 매핑 딕셔너리 생성 ---
+# --- 헬퍼: 법정동 코드(CSV) 로드 ---
 @lru_cache(maxsize=1)
 def get_bjdong_code_map() -> dict:
-    """(이 함수는 fetch_trade_data.py의 함수와 100% 동일합니다)"""
+    # (기존 코드와 동일)
     print("--- [헬퍼] 법정동 코드 마스터(CSV) 로드 중... (1회 실행) ---")
     try:
         df = pd.read_csv(LEGAL_CODES_CSV_PATH, sep=',', encoding='cp949', dtype=str)
@@ -55,9 +57,11 @@ def get_bjdong_code_map() -> dict:
     return code_map
 
 
-# --- 1. XML 파싱 함수 ---
-def parse_rent_xml_to_df(xml_text: str, code_map: dict) -> pd.DataFrame:
-    """전월세 실거래가 API의 XML 응답을 DataFrame으로 파싱합니다."""
+# --- 1. XML 파싱 함수 (수정됨) ---
+def parse_rent_xml_to_df(xml_text: str, code_map: dict, building_type: str) -> pd.DataFrame:
+    """
+    [수정] building_type 인자를 추가로 받아서 '건물유형' 컬럼에 넣습니다.
+    """
     try:
         root = ET.fromstring(xml_text)
     except ET.ParseError:
@@ -68,7 +72,6 @@ def parse_rent_xml_to_df(xml_text: str, code_map: dict) -> pd.DataFrame:
 
     records = []
     for item in items:
-        # (본번, 부번, 날짜, 금액 파싱 로직은 동일)
         bonbeon, bubeon = '0000', '0000'
         jibun_str = item.findtext('jibun', '').strip()
 
@@ -85,13 +88,12 @@ def parse_rent_xml_to_df(xml_text: str, code_map: dict) -> pd.DataFrame:
         deposit_str = item.findtext('deposit', '0').replace(',', '').strip()
         rent_str = item.findtext('monthlyRent', '0').replace(',', '').strip()
 
-        # [핵심 수정] 이름(umdNm) -> 코드(bjdongCd) 변환
         sgg_code = item.findtext('sggCd').strip()
         dong_name = item.findtext('umdNm', '').strip()
         bjdong_code = code_map.get((sgg_code, dong_name))
 
         if bjdong_code is None:
-            continue  # 매핑 실패
+            continue
 
         record = {
             '시군구': sgg_code,
@@ -101,49 +103,49 @@ def parse_rent_xml_to_df(xml_text: str, code_map: dict) -> pd.DataFrame:
             '보증금': deposit_str,
             '월세': rent_str,
             '계약일': deal_date,
-            '계약유형': item.findtext('contractType').strip()
+            '계약유형': item.findtext('contractType').strip(),
+            '건물유형': building_type  # [추가] 아파트/연립다세대/오피스텔 저장
         }
         records.append(record)
     return pd.DataFrame(records)
 
 
-# --- 2. API 호출 함수 ---
+# --- 2. API 호출 함수 (수정됨) ---
 def fetch_rent_data_and_save(lawd_cd: str, deal_ymd: str, code_map: dict) -> bool:
     """모든 유형(아파트, 빌라, 오피스텔)의 API를 호출하고 통합 저장"""
 
-    all_dfs = []  # 모든 API 결과를 취합할 리스트
+    all_dfs = []
 
-    # 3개 API URL을 순회
+    # [수정] 딕셔너리의 Key(아파트, 연립다세대, 오피스텔)를 활용
     for building_type, api_url in API_URLS_RENT.items():
         params = {'serviceKey': API_SERVICE_KEY, 'LAWD_CD': lawd_cd, 'DEAL_YMD': deal_ymd, 'numOfRows': '1000'}
         try:
             response = requests.get(api_url, params=params, timeout=30)
             response.raise_for_status()
 
-            # 공통 파싱 함수 사용
-            df_api_data = parse_rent_xml_to_df(response.text, code_map)
+            # [수정] 파싱 함수에 building_type 전달
+            df_api_data = parse_rent_xml_to_df(response.text, code_map, building_type)
 
             if not df_api_data.empty:
                 print(f"  -> {building_type}: {len(df_api_data)} 건 수집됨.")
                 all_dfs.append(df_api_data)
             else:
-                print(f"  -> {building_type}: 데이터 없음 (0건).")
+                # 데이터가 없어도 에러는 아님
+                pass
 
         except Exception as e:
             print(f"  -> {building_type} API 처리 실패: {e}")
-            # 한 유형이 실패해도 다른 유형은 계속 진행
             continue
 
-            # 모든 결과를 하나로 합쳐서 DB에 저장
     if not all_dfs:
         print("  -> 최종 저장: 0건.")
-        return True  # 실패가 아닌 '0건'이므로 True 반환
+        return True
 
     try:
         df_combined = pd.concat(all_dfs, ignore_index=True)
-        # 중복 데이터 제거 (API가 데이터를 중복 제공할 경우 대비)
         df_combined = df_combined.drop_duplicates()
 
+        # DB에 저장 (건물유형 컬럼이 자동으로 추가됨)
         df_combined.to_sql(RENT_TABLE_NAME, con=engine, if_exists='append', index=False)
         print(f"  -> 최종 저장: {len(df_combined)} 건 완료.")
         return True
@@ -152,9 +154,9 @@ def fetch_rent_data_and_save(lawd_cd: str, deal_ymd: str, code_map: dict) -> boo
         return False
 
 
-# --- 3. DB 관리 함수 (수정 불필요) ---
+# --- 3. DB 관리 함수 ---
 def get_regions_to_fetch_from_db() -> list:
-    # (이하 'meta_sgg_codes'의 'rent_last_fetched_date'를 읽는 로직 동일)
+    # (기존 코드와 동일)
     try:
         with engine.connect() as conn:
             query = f"""
@@ -171,7 +173,7 @@ def get_regions_to_fetch_from_db() -> list:
 
 
 def update_fetch_progress_in_db(region_code: str, date_ym: str):
-    # (이하 'rent_last_fetched_date' 업데이트 로직 동일)
+    # (기존 코드와 동일)
     try:
         with engine.connect() as conn:
             query = text(f"""
@@ -191,7 +193,6 @@ def main_fetch_loop():
     call_count = 0
     oldest_date_dt = pd.to_datetime(OLDEST_DATE_YMD, format='%Y%m')
 
-    # 스크립트 시작 시 1회만 법정동 코드 맵을 로드
     code_map = get_bjdong_code_map()
     if not code_map:
         print("[치명적 오류] 법정동 코드 맵을 생성할 수 없어 스크립트를 종료합니다.")
@@ -218,7 +219,6 @@ def main_fetch_loop():
                     f"[{datetime.now().strftime('%H:%M:%S')}] 수집 시도: {region_code}-{date_ym_str} (호출 {call_count + 1})")
                 call_count += 1
 
-                # [수정] code_map 인자 전달
                 success = fetch_rent_data_and_save(region_code, date_ym_str, code_map)
 
                 if success:
