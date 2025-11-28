@@ -13,8 +13,8 @@ def init_db():
     """
     모든 테이블 초기화
     1. 작업 로그 (중복 방지)
-    2. 일반건축물대장 (다가구, 상가주택 등 - 1인 소유)
-    3. 집합건축물대장 전유부 (아파트, 빌라, 오피스텔 - 호수별 소유)
+    2. 집합건축물대장 전유부 (아파트, 빌라, 오피스텔 - 호수별 소유)
+    3. 집합건축물대장 표제부
     """
     print(f"[DB Manager] 초기화 및 테이블 점검 시작: {DB_PATH}")
 
@@ -25,6 +25,7 @@ def init_db():
     # cur.execute("DROP TABLE IF EXISTS api_job_log")
     # cur.execute("DROP TABLE IF EXISTS public_price_history")
     # cur.execute("DROP TABLE IF EXISTS building_info")
+    # cur.execute("DROP TABLE IF EXISTS building_title_info")
 
     """
     테이블 명: building_info
@@ -106,12 +107,49 @@ def init_db():
         CREATE TABLE IF NOT EXISTS api_job_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             search_address VARCHAR(255) UNIQUE, -- 중복 수집 방지
+            job_type VARCHAR(20) DEFAULT 'EXCLUSIVE', -- 작업 유형 ('EXCLUSIVE', 'TITLE')
             status VARCHAR(50),                 -- 작업 상태 (DETAIL_SAVED 등)
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
     ''')
 
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS building_title_info (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            
+            -- 1. 식별 정보
+            unique_number VARCHAR(50) NOT NULL UNIQUE, -- 고유번호 (PK)
+            sigungu_code VARCHAR(10),
+            bjdong_code VARCHAR(10),
+            bunji VARCHAR(20),
+            
+            -- 2. 주소 및 건물명
+            road_address VARCHAR(255),
+            detail_address VARCHAR(100),               -- 건물명 (예: 광일아파트)
+            dong_name VARCHAR(50),                     -- 동 명칭 (예: 1동, A동)
+            
+            -- 3. 건물 스펙
+            main_use VARCHAR(100),                     -- 주용도 (아파트)
+            structure_type VARCHAR(100),               -- 주구조 (철근콘크리트조 - 내구연한 판단용)
+            total_floor_area DECIMAL(15, 2),           -- 연면적
+            
+            household_cnt INTEGER DEFAULT 0,           -- 총 세대수 (55세대 - 나홀로 아파트 여부 판단)
+            grnd_flr_cnt INTEGER DEFAULT 0,            -- 지상 층수 (5층)
+            und_flr_cnt INTEGER DEFAULT 0,             -- 지하 층수 (1층)
+            
+            -- 4. 편의 시설 (삶의 질 & 가격 영향)
+            parking_cnt INTEGER DEFAULT 0,             -- 주차대수 (자주식+기계식 합산)
+            elevator_cnt INTEGER DEFAULT 0,            -- 승강기대수 (승용+비상용)
+            
+            -- 5. 리스크 및 가치 지표
+            use_apr_day DATE,                          -- 사용승인일 (1985-01-15 -> 재건축 가능성/노후도)
+            is_violating CHAR(1) DEFAULT 'N',          -- 위반건축물 여부 (노란 딱지)
+            
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    ''')
     conn.commit()
     conn.close()
     print("[DB Manager] 테이블 점검 완료")
