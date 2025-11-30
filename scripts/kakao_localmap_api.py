@@ -28,15 +28,9 @@ def get_road_address_from_kakao(jibun_address):
         if documents:
             # road_address가 있으면 반환, 없으면(지번만 있는 땅) None
             road_addr_obj = documents[0].get('road_address')
+            # 도로명만 조회되게 수정
             if road_addr_obj:
-                full_addr = road_addr_obj.get('address_name', '')
-                bldg_name = road_addr_obj.get('building_name', '').strip()
-
-                if bldg_name:
-                    return f"{full_addr} {bldg_name}"
-                else:
-                    return full_addr
-
+                return road_addr_obj.get('address_name', '')
         return None
 
     except Exception as e:
