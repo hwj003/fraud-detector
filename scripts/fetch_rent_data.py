@@ -88,6 +88,7 @@ def parse_rent_xml_to_df(xml_text: str, code_map: dict, building_type: str) -> p
         deposit_str = item.findtext('deposit', '0').replace(',', '').strip()
         rent_str = item.findtext('monthlyRent', '0').replace(',', '').strip()
 
+        floor_str = item.findtext('floor', '1').strip()  # 없으면 1층 간주
         sgg_code = item.findtext('sggCd').strip()
         dong_name = item.findtext('umdNm', '').strip()
         bjdong_code = code_map.get((sgg_code, dong_name))
@@ -104,7 +105,8 @@ def parse_rent_xml_to_df(xml_text: str, code_map: dict, building_type: str) -> p
             '월세': rent_str,
             '계약일': deal_date,
             '계약유형': item.findtext('contractType').strip(),
-            '건물유형': building_type  # [추가] 아파트/연립다세대/오피스텔 저장
+            '건물유형': building_type,
+            '층': floor_str
         }
         records.append(record)
     return pd.DataFrame(records)
@@ -116,14 +118,14 @@ def fetch_rent_data_and_save(lawd_cd: str, deal_ymd: str, code_map: dict) -> boo
 
     all_dfs = []
 
-    # [수정] 딕셔너리의 Key(아파트, 연립다세대, 오피스텔)를 활용
+    # 딕셔너리의 Key(아파트, 연립다세대, 오피스텔)를 활용
     for building_type, api_url in API_URLS_RENT.items():
         params = {'serviceKey': API_SERVICE_KEY, 'LAWD_CD': lawd_cd, 'DEAL_YMD': deal_ymd, 'numOfRows': '1000'}
         try:
             response = requests.get(api_url, params=params, timeout=30)
             response.raise_for_status()
 
-            # [수정] 파싱 함수에 building_type 전달
+            # 파싱 함수에 building_type 전달
             df_api_data = parse_rent_xml_to_df(response.text, code_map, building_type)
 
             if not df_api_data.empty:
