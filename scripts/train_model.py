@@ -1,191 +1,167 @@
-# fraud_detector_project/scripts/train_model.py
-
 import pandas as pd
 import numpy as np
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
-from sklearn.preprocessing import StandardScaler
-from joblib import dump
+import matplotlib.pyplot as plt
+import seaborn as sns
 import os
 import sys
+import joblib # 모델 저장용 라이브러리
 
-# Snorkel
-from snorkel.labeling import LabelingFunction, PandasLFApplier
-from snorkel.labeling.model import LabelModel
-from snorkel.labeling import filter_unlabeled_dataframe
+# Scikit-Learn 머신러닝 라이브러리
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, roc_auc_score
 
-# --- [필수] 프로젝트 루트 경로 추가 ---
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-sys.path.append(project_root)
+# 한글 폰트 설정 (그래프용)
+import platform
+if platform.system() == 'Darwin': plt.rc('font', family='AppleGothic')
+elif platform.system() == 'Windows': plt.rc('font', family='Malgun Gothic')
+else: plt.rc('font', family='NanumGothic')
+plt.rc('axes', unicode_minus=False)
 
-# --- 중앙 설정 및 모델 정의 임포트 ---
-# (이 시점에 app/core/config.py가 실행되며 DB 연결 로그가 찍힐 수 있습니다)
-from app.core.config import engine
-from app.model_def import FraudNet
+# ---------------------------------------------------------
+# 1. 프로젝트 경로 설정
+# ---------------------------------------------------------
+# 스크립트 파일 위치 기준 상위 폴더를 루트로 지정
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.abspath(os.path.join(BASE_DIR, '..'))
+
+if PROJECT_ROOT not in sys.path:
+    sys.path.append(PROJECT_ROOT)
+
+# 데이터 프로세서 임포트
 from scripts.data_processor import load_and_engineer_features
 
-# --- 상수 정의 ---
-FRAUD = 1
-NORMAL = 0
-ABSTAIN = -1
-ASSETS_DIR = os.path.join(project_root, 'assets')
-MODEL_PATH = os.path.join(ASSETS_DIR, 'fraud_model.pth')
-SCALER_PATH = os.path.join(ASSETS_DIR, 'scaler.pkl')
-COLUMNS_PATH = os.path.join(ASSETS_DIR, 'feature_columns.txt')
+# 한글 폰트 설정 (그래프 저장용)
+import platform
+if platform.system() == 'Darwin': font_family = 'AppleGothic'
+elif platform.system() == 'Windows': font_family = 'Malgun Gothic'
+else: font_family = 'NanumGothic'
+plt.rc('font', family=font_family)
+plt.rc('axes', unicode_minus=False)
 
+def train_and_save_model():
+    print("\n" + "=" * 60)
+    print("🚀 [Start] 전세사기 위험도 예측 모델 학습 시작")
+    print("=" * 60)
 
-def lf_high_debt_ratio(x):
-    """LF 2: 부채+전세가율(가상)이 100% 이상이면 위험"""
-    return FRAUD if x['loan_plus_jeonse_ratio'] > 1.0 else ABSTAIN
+    # ---------------------------------------------------------
+    # 2. 데이터 로드 및 라벨링
+    # ---------------------------------------------------------
+    print("\n>> 1. 데이터 로드 및 전처리 중...")
+    df = load_and_engineer_features()
 
-def lf_high_jeonse_ratio_only(x):
-    """LF 3: (부채 없는) 전세가율이 90% 이상이면 위험"""
-    return FRAUD if x['jeonse_ratio'] > 0.9 else ABSTAIN
+    # [약한 라벨링] 정답지(is_fraud) 생성
+    # 기준: HUG 불가 OR 깡통전세 OR 신탁 OR 단기소유(동시진행)
+    df['is_fraud'] = (
+            (df['hug_risk_ratio'] > 1.0) |
+            (df['total_risk_ratio'] > 1.0) |
+            (df['is_trust_owner'] == 1) |
+            (df['short_term_weight'] >= 0.3) |
+            (df['is_illegal_building'] == 1)
+    ).astype(int)
 
-def lf_illegal_and_high_ratio(x):
-    """LF 4: 위반건축물이면서 전세가율이 80% 이상이면 위험"""
-    return FRAUD if x['is_illegal_building'] == 1 and x['jeonse_ratio'] > 0.8 else ABSTAIN
+    total_cnt = len(df)
+    fraud_cnt = df['is_fraud'].sum()
+    safe_cnt = total_cnt - fraud_cnt
 
-def lf_commercial_use(x):
-    """LF 5: '근린생활시설' 매물은 위험"""
-    return FRAUD if x['building_use_근린생활시설'] == 1 else ABSTAIN
+    print(f"   전체 데이터: {total_cnt}건")
+    print(f"   위험(Fraud) 클래스: {fraud_cnt}건 ({fraud_cnt / total_cnt * 100:.1f}%)")
+    print(f"   안전(Safe) 클래스: {safe_cnt}건")
 
-def lf_safe_apartment(x):
-    """LF 6: (안전 신호) 아파트이고 부채+전세가율이 70% 미만이면 정상"""
-    if x['building_use_아파트'] == 1 and x['loan_plus_jeonse_ratio'] < 0.7:
-        return NORMAL
-    return ABSTAIN
-
-# [추가 LF 7] - 아파트 조건 없이, 부채 포함 비율이 낮으면 정상
-def lf_low_debt_ratio(x):
-    """LF 7: (안전 신호) 부채+전세가율이 70% 미만이면 정상"""
-    if x['loan_plus_jeonse_ratio'] < 0.7:
-        return NORMAL
-    return ABSTAIN
-
-# [추가 LF 8] - 전세가율 자체가 매우 낮으면 정상
-def lf_very_low_jeonse(x):
-    """LF 8: (안전 신호) 전세가율이 60% 미만이면 정상"""
-    if x['jeonse_ratio'] < 0.6:
-        return NORMAL
-    return ABSTAIN
-
-
-def main():
-    # assets 폴더 생성
-    os.makedirs(ASSETS_DIR, exist_ok=True)
-
-    # --- [1단계] 데이터 준비 (DB에서 실제 데이터 로드 및 가공) ---
-    print("--- [1] data_processor.py 호출 (특성 공학 시작) ---")
-    df_unlabeled = load_and_engineer_features()
-    print("--- [1] 특성 공학 완료 ---")
-
-    final_feature_columns = list(df_unlabeled.columns)
-    with open(COLUMNS_PATH, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(final_feature_columns))
-    print(f"--- 학습에 사용된 최종 컬럼 (총 {len(final_feature_columns)}개) 저장 완료 ---")
-    NUM_FEATURES = len(final_feature_columns)
-
-    # --- [2단계] 약한 라벨링 (Snorkel) ---
-    print("--- [2] 약한 라벨링(Snorkel) 시작 ---")
-
-    lfs = [
-        LabelingFunction(name="lf_high_debt_ratio", f=lf_high_debt_ratio),
-        LabelingFunction(name="lf_high_jeonse_ratio_only", f=lf_high_jeonse_ratio_only),
-        LabelingFunction(name="lf_illegal_and_high_ratio", f=lf_illegal_and_high_ratio),
-        LabelingFunction(name="lf_commercial_use", f=lf_commercial_use),
-        LabelingFunction(name="lf_safe_apartment", f=lf_safe_apartment),
-        LabelingFunction(name="lf_low_debt_ratio", f=lf_low_debt_ratio),
-        LabelingFunction(name="lf_very_low_jeonse", f=lf_very_low_jeonse)
+    # ---------------------------------------------------------
+    # 3. 학습용 데이터셋 분리
+    # ---------------------------------------------------------
+    # 학습에 사용할 피처 정의
+    feature_cols = [
+        'jeonse_ratio',  # 전세가율
+        'hug_risk_ratio',  # HUG 기준 위험도
+        'total_risk_ratio',  # 깡통전세 위험도
+        'building_age',  # 건물 연식
+        'parking_per_household',  # 세대당 주차대수
+        'is_micro_complex',  # 나홀로 아파트 여부
+        'estimated_loan_ratio',  # 추정 대출 비율
+        'is_trust_owner',  # 신탁 여부
+        'short_term_weight',  # 단기 소유 위험도
+        'is_illegal_building', # 위반 건축물 여부
     ]
 
-    applier = PandasLFApplier(lfs=lfs)
-    L_train = applier.apply(df=df_unlabeled)
+    # One-Hot Encoding된 용도 컬럼들 추가 (use_아파트 등, use_apr_day는 날짜이므로 제외!)
+    feature_cols.extend([
+        c for c in df.columns
+        if c.startswith('use_') and c != 'use_apr_day'
+    ])
 
-    label_model = LabelModel(cardinality=2, verbose=True)
-    label_model.fit(L_train=L_train, n_epochs=500, lr=0.001, log_freq=100)
+    # 실제 데이터프레임에 존재하는 컬럼만 선택 (에러 방지)
+    feature_cols = [f for f in feature_cols if f in df.columns]
 
-    probs_train = label_model.predict_proba(L=L_train)
-    weak_labels = np.argmax(probs_train, axis=1)
+    X = df[feature_cols]
+    y = df['is_fraud']
 
-    df_train_filtered, labels_train_filtered = filter_unlabeled_dataframe(
-        X=df_unlabeled, y=weak_labels, L=L_train
+    # 8:2 분리
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
     )
 
-    print(f"--- [2] 약한 라벨링 완료 (총 {len(df_unlabeled)}개 중 {len(df_train_filtered)}개 라벨링 성공) ---")
-    print("생성된 라벨 분포:\n", pd.Series(labels_train_filtered).value_counts())
+    # ---------------------------------------------------------
+    # 4. 모델 학습 (Random Forest)
+    # ---------------------------------------------------------
+    print("\n>> 3. 모델 학습 수행 (Random Forest)...")
+    rf_model = RandomForestClassifier(
+        n_estimators=100,
+        max_depth=10,
+        random_state=42,
+        n_jobs=-1
+    )
+    rf_model.fit(X_train, y_train)
+    print("   학습 완료!")
 
-    if len(df_train_filtered) == 0:
-        print("[오류] 라벨링된 데이터가 0개입니다. LFs가 ABSTAIN(-1)만 반환했는지 확인하세요.")
-        return  # 학습 중단
+    # ---------------------------------------------------------
+    # 5. 성능 평가
+    # ---------------------------------------------------------
+    print("\n>> 4. 성능 평가 결과")
+    y_pred = rf_model.predict(X_test)
+    y_pred_proba = rf_model.predict_proba(X_test)[:, 1]
 
-    # --- [3단계] PyTorch DataLoader 준비 ---
-    print("--- [3] PyTorch DataLoader 준비 중... ---")
+    acc = accuracy_score(y_test, y_pred)
+    roc = roc_auc_score(y_test, y_pred_proba)
 
-    X = df_train_filtered[final_feature_columns].values
-    y = labels_train_filtered
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-    X_scaled = np.nan_to_num(X_scaled, nan=0.0, posinf=5.0, neginf=-5.0)
+    print(f"   정확도(Accuracy): {acc:.4f}")
+    print(f"   ROC-AUC 점수: {roc:.4f}")
+    print("\n   [상세 리포트]")
+    print(classification_report(y_test, y_pred, target_names=['안전(0)', '위험(1)']))
 
-    dump(scaler, SCALER_PATH)
-    print(f"StandardScaler 저장 완료: {SCALER_PATH}")
+    # ---------------------------------------------------------
+    # 6. 결과 저장 (모델 & 피처 중요도 그래프)
+    # ---------------------------------------------------------
+    # 저장 경로 설정
+    model_dir = os.path.join(PROJECT_ROOT, 'models')
+    if not os.path.exists(model_dir):
+        os.makedirs(model_dir)
 
-    X_tensor = torch.tensor(X_scaled, dtype=torch.float32)
-    y_tensor = torch.tensor(y, dtype=torch.long)
-    dataset = TensorDataset(X_tensor, y_tensor)
-    train_loader = DataLoader(dataset, batch_size=64, shuffle=True)
+    # 1) 모델 파일 저장
+    model_path = os.path.join(model_dir, 'fraud_rf_model.pkl')
+    joblib.dump(rf_model, model_path)
+    print(f"\n>> 5. 모델 저장 완료: {model_path}")
 
-    # --- [4단계] 모델, 손실 함수, 옵티마이저 정의 ---
-    print("--- [4] 모델 및 옵티마이저 정의 ---")
+    # 2) 피처 중요도 이미지 저장
+    print("   -> 피처 중요도 그래프 저장 중...")
+    importances = rf_model.feature_importances_
+    indices = np.argsort(importances)[::-1]
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = FraudNet(input_size=NUM_FEATURES, num_classes=2).to(device)
+    plt.figure(figsize=(12, 8))
+    sns.barplot(x=importances[indices], y=X_train.columns[indices], palette='viridis')
+    plt.title("전세사기 예측 모델 중요 변수 (Feature Importance)")
+    plt.xlabel("중요도 (Importance Score)")
+    plt.ylabel("변수명")
+    plt.tight_layout()
 
-    counts = pd.Series(y).value_counts()
-    # (라벨이 하나만 있는 경우(e.g., 0만 있음) 에러 방지)
-    if 0 not in counts: counts[0] = 1
-    if 1 not in counts: counts[1] = 1
+    plot_path = os.path.join(model_dir, 'feature_importance.png')
+    plt.savefig(plot_path)
+    print(f"   -> 그래프 저장 완료: {plot_path}")
 
-    weights = (counts.sum() / counts).values
-    class_weights = torch.tensor(weights, dtype=torch.float32).to(device)
-    print(f"클래스 가중치 (0:정상, 1:사기): {class_weights.cpu().numpy()}")
+    print("\n" + "=" * 60)
+    print("🎉 모든 학습 과정이 성공적으로 끝났습니다.")
+    print("=" * 60)
 
-    criterion = nn.CrossEntropyLoss(weight=class_weights)
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
-
-    # --- [5단계] 모델 학습 ---
-    print("--- [5] PyTorch 모델 학습 시작 ---")
-    num_epochs = 20
-    model.train()
-
-    for epoch in range(num_epochs):
-        epoch_loss = 0
-        for inputs, labels in train_loader:
-            inputs, labels = inputs.to(device), labels.to(device)
-
-            outputs = model(inputs)
-            loss = criterion(outputs, labels)
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            epoch_loss += loss.item()
-
-        print(f'Epoch [{epoch + 1}/{num_epochs}], Loss: {epoch_loss / len(train_loader):.4f}')
-
-    print("--- 모델 학습 완료 ---")
-
-    # --- [6단계] 최종 모델 저장 ---
-    torch.save(model.state_dict(), MODEL_PATH)
-    print(f"\n--- [성공] 학습된 모델 저장 완료 ---")
-    print(f"모델 위치: {MODEL_PATH}")
-    print("이제 'python run_api.py'를 실행하여 API 서버를 켤 수 있습니다.")
-
-
-# --- [신규] 스크립트가 "직접 실행"되었을 때만 main() 함수 호출 ---
 if __name__ == "__main__":
-    main()
+    train_and_save_model()
