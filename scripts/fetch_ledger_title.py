@@ -4,8 +4,15 @@ import requests
 import json
 import sqlite3
 import urllib.parse
-from db_manager import init_db, get_connection
-from kakao_localmap_api import get_building_name_from_kakao
+# [수정] 경로 문제 해결을 위한 조건부 임포트
+try:
+    # 1. 외부(predict.py 등)에서 패키지로 불러올 때 (프로젝트 루트 기준)
+    from scripts.db_manager import init_db, get_connection
+    from scripts.kakao_localmap_api import get_building_name_from_kakao
+except ModuleNotFoundError:
+    # 2. 이 파일을 직접 실행할 때 (현재 폴더 기준)
+    from db_manager import init_db, get_connection
+    from kakao_localmap_api import get_building_name_from_kakao
 load_dotenv()
 # 전유부 (호수별) 데이터 수집 (가격, 소유자)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
