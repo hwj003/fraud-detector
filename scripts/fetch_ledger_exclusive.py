@@ -4,8 +4,15 @@ import requests
 import json
 import sqlite3
 import urllib.parse
-from db_manager import init_db, get_connection
-from kakao_localmap_api import get_building_name_from_kakao
+# [수정] 경로 문제 해결을 위한 조건부 임포트
+try:
+    # 1. 외부(predict.py 등)에서 패키지로 불러올 때 (프로젝트 루트 기준)
+    from scripts.db_manager import init_db, get_connection
+    from scripts.kakao_localmap_api import get_building_name_from_kakao
+except ModuleNotFoundError:
+    # 2. 이 파일을 직접 실행할 때 (현재 폴더 기준)
+    from db_manager import init_db, get_connection
+    from kakao_localmap_api import get_building_name_from_kakao
 
 load_dotenv()
 
@@ -17,12 +24,12 @@ DB_PATH = os.path.abspath(os.path.join(BASE_DIR, '..', 'local_fraud_db.sqlite'))
 # ==========================================
 # 계정 목록 (환경변수에 _1, _2 접미사 붙은 키 필요)
 ACCOUNTS = [
-    {
-        "client_id": os.getenv("CLIENT_ID_1"),
-        "client_secret": os.getenv("CLIENT_SECRET_1"),
-        "user_id": os.getenv("CODEF_USER_ID_1"),
-        "rsa_pass": os.getenv("CODEF_USER_RSA_PASSWORD_1")
-    },
+    # {
+    #     "client_id": os.getenv("CLIENT_ID_1"),
+    #     "client_secret": os.getenv("CLIENT_SECRET_1"),
+    #     "user_id": os.getenv("CODEF_USER_ID_1"),
+    #     "rsa_pass": os.getenv("CODEF_USER_RSA_PASSWORD_1")
+    # },
     {
         "client_id": os.getenv("CLIENT_ID_2"),
         "client_secret": os.getenv("CLIENT_SECRET_2"),
@@ -334,53 +341,73 @@ def get_dong_list_step(token, address):
 
 
 def get_ho_list_step(token, address, dong_code):
-    """[Step 1] 호 목록 반환 (동 코드 없으면 바로 호 목록 리턴)"""
+    """
+    호 목록 반환 (API 응답 코드 검사 추가)
+    """
     # 1. 주소 검색 (세션 시작)
     res0 = fetch_initial_search(token, address)
     if not res0: return None
 
+    code = res0['result']['code']
+    msg = res0['result']['message']
     data0 = res0.get('data', {})
     extra0 = data0.get('extraInfo', {})
 
-    # 1차 결과에 호 목록이 있으면 바로 리턴
-    if extra0.get('reqHoNumList'): return extra0['reqHoNumList']
-    if data0.get('resHoList'): return data0['resHoList']
+    # [예외 처리] API 오류이거나, 세션 키(jti)가 없는 경우 중단
+    if code != 'CF-03002' and code != 'CF-00000':
+        print(f"      [Warning] 호 목록 조회 진입 실패 ({code}): {msg}")
+        return []
 
-    # 단일 건물인데 호 목록이 안 보이면 동 코드가 없더라도 Step 2를 호출해서 호 목록을 확인
+    # [핵심] 동 코드가 없으면(단일 건물), 1차 결과의 호 목록 바로 반환
     if not dong_code:
-        # 동 코드 없이 Step 2 호출
-        res_step2 = fetch_next_step(
-            token, data0['jti'], data0['jobIndex'], data0['twoWayTimestamp'], data0['threadIndex'],
-            dong_num=None
-        )
+        if extra0.get('reqHoNumList'): return extra0['reqHoNumList']
+        if data0.get('resHoList'): return data0['resHoList']
+        return []
 
-        if res_step2:
-            data2 = res_step2.get('data', {})
-            extra2 = data2.get('extraInfo', {})
+    # -------------------------------------------------------
+    # 동 코드가 있는 경우 (아파트) -> 동 선택 요청 수행
+    # -------------------------------------------------------
 
-            # 여기서 호 목록 확인
-            if extra2.get('reqHoNumList'): return extra2['reqHoNumList']
-            if data2.get('resHoList'): return data2['resHoList']
+    # [Safety Check] 동 선택을 하려면 jti가 필수인데, 없는 경우 방어
+    if 'jti' not in data0:
+        # CF-00000 등으로 바로 끝나버려서 jti가 없는 경우 등
+        return []
 
-        return []  # 그래도 없으면 빈 배열 반환
-
-    # 동 코드가 있는 경우 (아파트)
+    # 2. 동 선택 요청
     res1 = fetch_next_step(
         token, data0['jti'], data0['jobIndex'], data0['twoWayTimestamp'], data0['threadIndex'],
         dong_num=dong_code
     )
+
     if not res1: return None
+
+    # 결과 코드 확인 (여기서도 실패할 수 있음)
+    if res1['result']['code'] != 'CF-03002':
+        return []
 
     extra1 = res1.get('data', {}).get('extraInfo', {})
     if extra1.get('reqHoNumList'): return extra1['reqHoNumList']
+
     return []
 
-
 def fetch_final_data_step(token, address, dong_code, ho_code):
-    """[Step 2] 최종 데이터 조회 (동 코드 유무에 따라 분기)"""
+    """
+    [Step 2] 최종 데이터 조회 (동 코드 유무에 따라 분기)
+    """
+    # 1차: 주소 검색 (세션 생성)
     res0 = fetch_initial_search(token, address)
     if not res0: return None
+
+    # [수정] 결과 코드 검사 (jti 존재 여부 확인)
+    code = res0['result']['code']
     data0 = res0.get('data', {})
+
+    # CF-03002가 아니면 jti가 없으므로 진행 불가
+    # (단일 건물인데 호 목록이 바로 나오는 경우는 이미 앞단 get_ho_list_step에서 처리했으므로 여기선 무조건 jti가 있어야 함)
+    if code != 'CF-03002' or 'jti' not in data0:
+        msg = res0['result']['message']
+        print(f"         [Error] 상세 조회 진입 실패 ({code}): {msg}")
+        return None
 
     # Case A: 단일 건물 -> 바로 호 선택
     if not dong_code:
@@ -390,11 +417,16 @@ def fetch_final_data_step(token, address, dong_code, ho_code):
         )
 
     # Case B: 아파트 -> 동 선택 -> 호 선택
+    # 동 선택 요청
     res1 = fetch_next_step(
         token, data0['jti'], data0['jobIndex'], data0['twoWayTimestamp'], data0['threadIndex'],
         dong_num=dong_code
     )
-    if not res1: return None
+
+    # 동 선택 실패 시 (jti 없음 등)
+    if not res1 or res1['result']['code'] != 'CF-03002':
+        return None
+
     data1 = res1.get('data', {})
 
     return fetch_next_step(
@@ -506,7 +538,7 @@ def get_targets_from_rent_db(limit=100):
             LEFT JOIN api_job_log log 
               ON (m.bjdong_name || ' ' || CAST(r.본번 AS INTEGER) || CASE WHEN CAST(r.부번 AS INTEGER) = 0 THEN '' ELSE '-' || CAST(r.부번 AS INTEGER) END) = log.search_address
               AND log.job_type = 'EXCLUSIVE'
-            WHERE log.search_address IS NULL AND r.건물유형 = '오피스텔'
+            WHERE log.search_address IS NULL AND r.건물유형 = '연립다세대'
             ORDER BY RANDOM() LIMIT 20
         )
         UNION ALL
@@ -517,7 +549,7 @@ def get_targets_from_rent_db(limit=100):
             LEFT JOIN api_job_log log 
               ON (m.bjdong_name || ' ' || CAST(r.본번 AS INTEGER) || CASE WHEN CAST(r.부번 AS INTEGER) = 0 THEN '' ELSE '-' || CAST(r.부번 AS INTEGER) END) = log.search_address
               AND log.job_type = 'EXCLUSIVE'
-            WHERE log.search_address IS NULL AND r.건물유형 = '연립다세대'
+            WHERE log.search_address IS NULL AND r.건물유형 = '오피스텔'
             ORDER BY RANDOM() LIMIT 20
         )
     """
