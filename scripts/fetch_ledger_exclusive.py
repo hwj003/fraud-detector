@@ -8,11 +8,11 @@ import urllib.parse
 try:
     # 1. 외부(predict.py 등)에서 패키지로 불러올 때 (프로젝트 루트 기준)
     from scripts.db_manager import init_db, get_connection
-    from scripts.kakao_localmap_api import get_building_name_from_kakao
+    from scripts.kakao_localmap_api import get_building_name_from_kakao, get_road_address_from_kakao
 except ModuleNotFoundError:
     # 2. 이 파일을 직접 실행할 때 (현재 폴더 기준)
     from db_manager import init_db, get_connection
-    from kakao_localmap_api import get_building_name_from_kakao
+    from kakao_localmap_api import get_building_name_from_kakao, get_road_address_from_kakao
 
 load_dotenv()
 
@@ -24,18 +24,18 @@ DB_PATH = os.path.abspath(os.path.join(BASE_DIR, '..', 'local_fraud_db.sqlite'))
 # ==========================================
 # 계정 목록 (환경변수에 _1, _2 접미사 붙은 키 필요)
 ACCOUNTS = [
-    # {
-    #     "client_id": os.getenv("CLIENT_ID_1"),
-    #     "client_secret": os.getenv("CLIENT_SECRET_1"),
-    #     "user_id": os.getenv("CODEF_USER_ID_1"),
-    #     "rsa_pass": os.getenv("CODEF_USER_RSA_PASSWORD_1")
-    # },
     {
-        "client_id": os.getenv("CLIENT_ID_2"),
-        "client_secret": os.getenv("CLIENT_SECRET_2"),
-        "user_id": os.getenv("CODEF_USER_ID_2"),
-        "rsa_pass": os.getenv("CODEF_USER_RSA_PASSWORD_2")
+        "client_id": os.getenv("CLIENT_ID_1"),
+        "client_secret": os.getenv("CLIENT_SECRET_1"),
+        "user_id": os.getenv("CODEF_USER_ID_1"),
+        "rsa_pass": os.getenv("CODEF_USER_RSA_PASSWORD_1")
     }
+    # {
+    #     "client_id": os.getenv("CLIENT_ID_2"),
+    #     "client_secret": os.getenv("CLIENT_SECRET_2"),
+    #     "user_id": os.getenv("CODEF_USER_ID_2"),
+    #     "rsa_pass": os.getenv("CODEF_USER_RSA_PASSWORD_2")
+    # }
 ]
 
 CURRENT_ACCOUNT_IDX = 0
@@ -574,6 +574,114 @@ def get_targets_from_rent_db(limit=100):
     finally:
         conn.close()
 
+
+import re
+import urllib.parse
+
+
+def extract_floor_from_ho_name(ho_name):
+    """
+    [Helper] 호수 명칭에서 층수 추출 (예: '1504호' -> 15층)
+    """
+    numbers = re.findall(r'\d+', ho_name)
+    if not numbers: return -1
+
+    val = int(numbers[0])
+
+    # 4자리 이상(1001호~)이면 앞자리를 층수로, 3자리(101호~)면 앞자리를 층수로
+    # 보통 100으로 나눈 몫을 층수로 봅니다. (지하 B1 등은 제외)
+    floor = val // 100
+
+    if 'B' in ho_name or '지' in ho_name or floor == 0:
+        return -1  # 지하나 0층은 제외
+
+    return floor
+
+
+def fetch_target_middle_unit(token, target_address, original_address=None):
+    """
+    [수정됨] 특정 주소의 [중간 동] -> [중간 층 호수]를 수집하여 표본의 대표성을 높임.
+    성공 시 True, 실패 시 False 반환.
+    """
+    # 로깅용 주소 (지번이 없으면 타겟 주소 사용)
+    addr_log = original_address if original_address else target_address
+    print(f"      [Sub-Task] '{addr_log}' 표본(중간값) 수집 시도...")
+
+    # 1. 동 목록 확보
+    dong_list, res_data = get_dong_list_step(token, target_address)
+
+    if not dong_list:
+        return False
+
+    # ---------------------------------------------------------
+    # [Logic Change] 중간 동(Median Dong) 선택
+    # ---------------------------------------------------------
+    # 가나다/숫자 순 정렬
+    dong_list.sort(key=lambda x: x.get('reqDong', ''))
+
+    # 상가, 관리동 등 비주거용 제외 필터링 (선택사항)
+    valid_dongs = [d for d in dong_list if '상가' not in d.get('reqDong', '')]
+    if not valid_dongs: valid_dongs = dong_list  # 다 걸러졌으면 원본 사용
+
+    # 중간 인덱스 선택
+    mid_idx = len(valid_dongs) // 2
+    target_dong = valid_dongs[mid_idx]
+
+    target_dong_name = urllib.parse.unquote_plus(target_dong.get('reqDong', '')).strip()
+    target_dong_code = target_dong.get('commDongNum')
+
+    print(f"      [Selected Dong] 중간 동 선택: '{target_dong_name}' ({mid_idx + 1}/{len(valid_dongs)})")
+
+    # 2. 호 목록 확보
+    ho_list = get_ho_list_step(token, target_address, target_dong_code)
+
+    if not ho_list:
+        return False
+
+    # ---------------------------------------------------------
+    # [Logic Change] 중간 층(Median Floor)의 호수 선택
+    # ---------------------------------------------------------
+    # 층별로 호수 그룹화
+    floors_map = {}
+    for ho in ho_list:
+        h_name = urllib.parse.unquote_plus(ho['reqHo'])
+        floor = extract_floor_from_ho_name(h_name)
+
+        if floor > 0:  # 지상층만 대상
+            if floor not in floors_map: floors_map[floor] = []
+            floors_map[floor].append(ho)
+
+    target_ho = None
+
+    if floors_map:
+        # 존재하는 층수들을 정렬 (예: 1, 2, ..., 15)
+        sorted_floors = sorted(floors_map.keys())
+
+        # 중간 층 선택 (예: 15층 건물이면 7~8층)
+        mid_floor_idx = len(sorted_floors) // 2
+        mid_floor = sorted_floors[mid_floor_idx]
+
+        # 해당 층의 첫 번째 호수 선택 (예: 801호)
+        target_ho = floors_map[mid_floor][0]
+        print(f"      [Selected Floor] 총 {len(sorted_floors)}개 층 중 {mid_floor}층 선택")
+    else:
+        # 층수 파싱 실패 시(빌라 등) 그냥 중간 인덱스 호수 선택
+        target_ho = ho_list[len(ho_list) // 2]
+        print(f"      [Selected Floor] 층수 파싱 불가 -> 단순 중간 호수 선택")
+
+    ho_name = urllib.parse.unquote_plus(target_ho['reqHo'])
+    ho_code = target_ho['commHoNum']
+
+    print(f"      [Selected Ho] 최종 타겟: {ho_name}")
+
+    # 3. 최종 데이터 조회 및 저장
+    final_res = fetch_final_data_step(token, target_address, target_dong_code, ho_code)
+
+    if final_res and final_res['result']['code'] == 'CF-00000':
+        parse_and_save(final_res, target_dong_name, ho_name)
+        return True
+    else:
+        return False
 
 if __name__ == "__main__":
     CURRENT_TOKEN = get_access_token()
