@@ -4,15 +4,16 @@ import requests
 import json
 import sqlite3
 import urllib.parse
+import pandas as pd
 # [수정] 경로 문제 해결을 위한 조건부 임포트
 try:
     # 1. 외부(predict.py 등)에서 패키지로 불러올 때 (프로젝트 루트 기준)
     from scripts.db_manager import init_db, get_connection
-    from scripts.kakao_localmap_api import get_building_name_from_kakao, get_road_address_from_kakao
+    from scripts.kakao_localmap_api import get_building_name_from_kakao, get_road_address_from_kakao, get_all_address_and_building_from_kakao
 except ModuleNotFoundError:
     # 2. 이 파일을 직접 실행할 때 (현재 폴더 기준)
     from db_manager import init_db, get_connection
-    from kakao_localmap_api import get_building_name_from_kakao, get_road_address_from_kakao
+    from kakao_localmap_api import get_building_name_from_kakao, get_road_address_from_kakao, get_all_address_and_building_from_kakao
 
 load_dotenv()
 
@@ -23,23 +24,10 @@ DB_PATH = os.path.abspath(os.path.join(BASE_DIR, '..', 'local_fraud_db.sqlite'))
 # 1. 설정 (Configuration) - 다중 계정 지원
 # ==========================================
 # 계정 목록 (환경변수에 _1, _2 접미사 붙은 키 필요)
-ACCOUNTS = [
-    {
-        "client_id": os.getenv("CLIENT_ID_1"),
-        "client_secret": os.getenv("CLIENT_SECRET_1"),
-        "user_id": os.getenv("CODEF_USER_ID_1"),
-        "rsa_pass": os.getenv("CODEF_USER_RSA_PASSWORD_1")
-    }
-    # {
-    #     "client_id": os.getenv("CLIENT_ID_2"),
-    #     "client_secret": os.getenv("CLIENT_SECRET_2"),
-    #     "user_id": os.getenv("CODEF_USER_ID_2"),
-    #     "rsa_pass": os.getenv("CODEF_USER_RSA_PASSWORD_2")
-    # }
-]
-
-CURRENT_ACCOUNT_IDX = 0
-CURRENT_TOKEN = None
+CLIENT_ID = os.getenv("CLIENT_ID_2")
+CLIENT_SECRET = os.getenv("CLIENT_SECRET_2")
+CODEF_USER_ID = os.getenv("CODEF_USER_ID_2")
+CODEF_USER_RSA_PASSWORD = os.getenv("CODEF_USER_RSA_PASSWORD_2")
 
 # API 엔드포인트
 TOKEN_URL = "https://oauth.codef.io/oauth/token"
@@ -50,9 +38,6 @@ API_URL = "https://development.codef.io/v1/kr/public/lt/eais/aggregate-buildings
 # 2. 토큰 및 계정 관리 함수
 # ==========================================
 def get_access_token():
-    """현재 활성화된 계정으로 토큰 발급"""
-    global CURRENT_ACCOUNT_IDX
-    account = ACCOUNTS[CURRENT_ACCOUNT_IDX]
 
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
     data = {"grant_type": "client_credentials", "scope": "read"}
@@ -62,30 +47,14 @@ def get_access_token():
             TOKEN_URL,
             headers=headers,
             data=data,
-            auth=(account['client_id'], account['client_secret'])
+            auth=(CLIENT_ID, CLIENT_SECRET)
         )
         response.raise_for_status()
         token = response.json().get("access_token")
-        print(f"[Account {CURRENT_ACCOUNT_IDX + 1}] 토큰 발급 성공")
         return token
     except Exception as e:
-        print(f"[Account {CURRENT_ACCOUNT_IDX + 1}] 토큰 발급 실패: {e}")
+        print(f"[Error] {e}")
         return None
-
-
-def switch_account():
-    """다음 계정으로 전환"""
-    global CURRENT_ACCOUNT_IDX, CURRENT_TOKEN
-
-    NEXT_IDX = (CURRENT_ACCOUNT_IDX + 1) % len(ACCOUNTS)
-    if NEXT_IDX == 0 and len(ACCOUNTS) > 1:
-        print("모든 계정의 한도가 소진되었습니다.")
-        sys.exit(0)
-
-    print(f"\n[Switch] 계정 전환: {CURRENT_ACCOUNT_IDX + 1}번 -> {NEXT_IDX + 1}번")
-    CURRENT_ACCOUNT_IDX = NEXT_IDX
-    CURRENT_TOKEN = get_access_token()
-    return CURRENT_TOKEN
 
 
 def send_api_request(token, payload):
@@ -105,21 +74,8 @@ def send_api_request(token, payload):
 
         # Failover 로직
         if result['result']['code'] == 'CF-00012':
-            print(f"[Limit Reached] 계정 {CURRENT_ACCOUNT_IDX + 1} 한도 초과! 전환 시도...")
-            new_token = switch_account()
-
-            if new_token:
-                # Payload ID/PW 교체
-                current_acc = ACCOUNTS[CURRENT_ACCOUNT_IDX]
-                if 'id' in payload:
-                    payload['id'] = current_acc['user_id']
-                    payload['password'] = current_acc['rsa_pass']
-
-                print("[Retry] 새 계정으로 요청 재시도...")
-                return send_api_request(new_token, payload)
-            else:
-                sys.exit(0)
-
+            print(f"CF-00012 일일 100회 제한이 초과되었습니다.")
+            sys.exit(0)
         return result
 
     except Exception as e:
@@ -132,12 +88,11 @@ def send_api_request(token, payload):
 # ==========================================
 def fetch_initial_search(token, address):
     """[Step 1] 최초 주소 검색"""
-    account = ACCOUNTS[CURRENT_ACCOUNT_IDX]
     payload = {
         "organization": "0008",
         "loginType": "1",
-        "id": account['user_id'],
-        "password": account['rsa_pass'],
+        "id": CODEF_USER_ID,
+        "password": CODEF_USER_RSA_PASSWORD,
         "address": address,
         "dong": ""
     }
@@ -146,12 +101,11 @@ def fetch_initial_search(token, address):
 
 def fetch_next_step(token, jti, jobIndex, twoWayTimestamp, threadIndex, dong_num=None, ho_num=None):
     """[Step 2 & 3] 2-Way 추가 인증"""
-    account = ACCOUNTS[CURRENT_ACCOUNT_IDX]
     payload = {
         "organization": "0008",
         "loginType": "1",
-        "id": account['user_id'],
-        "password": account['rsa_pass'],
+        "id": CODEF_USER_ID,
+        "password": CODEF_USER_RSA_PASSWORD,
         "is2Way": True,
         "twoWayInfo": {
             "jobIndex": jobIndex,
@@ -164,18 +118,6 @@ def fetch_next_step(token, jti, jobIndex, twoWayTimestamp, threadIndex, dong_num
     if ho_num: payload["hoNum"] = ho_num
 
     return send_api_request(token, payload)
-
-
-# ==========================================
-# 4. 헬퍼 함수
-# ==========================================
-def extract_floor_from_ho_name(ho_name):
-    numbers = re.findall(r'\d+', ho_name)
-    if not numbers: return -1
-    val = int(numbers[0])
-    floor = val // 100
-    if 'B' in ho_name or '지' in ho_name or floor == 0: return -1
-    return floor
 
 
 def select_sample_targets(ho_list):
@@ -360,8 +302,10 @@ def get_ho_list_step(token, address, dong_code):
 
     # [핵심] 동 코드가 없으면(단일 건물), 1차 결과의 호 목록 바로 반환
     if not dong_code:
-        if extra0.get('reqHoNumList'): return extra0['reqHoNumList']
-        if data0.get('resHoList'): return data0['resHoList']
+        if extra0.get('reqHoNumList'):
+            return extra0['reqHoNumList']
+        if data0.get('resHoList'):
+            return data0['resHoList']
         return []
 
     # -------------------------------------------------------
@@ -386,7 +330,8 @@ def get_ho_list_step(token, address, dong_code):
         return []
 
     extra1 = res1.get('data', {}).get('extraInfo', {})
-    if extra1.get('reqHoNumList'): return extra1['reqHoNumList']
+    if extra1.get('reqHoNumList'):
+        return extra1['reqHoNumList']
 
     return []
 
@@ -447,11 +392,33 @@ def collect_apartment_complex(token, start_address):
     building_name = get_building_name_from_kakao(start_address)
     target_address = f"{start_address} {building_name}" if building_name else start_address
 
-    # 1. 동 목록 확보
+    # 1. 동 목록 확보 (지번 + 건물명)
     dong_list, res_data = get_dong_list_step(token, target_address)
 
+    # 2차 시도: 1차 실패 시 실행 (도로명 + 건물명)
     if not dong_list:
-        print("   [Fail] 동 목록 없음")
+        print(f"   [Retry] '{target_address}' 조회 실패 -> 도로명 주소로 재시도")
+
+        try:
+            # 도로명 주소 변환 (여기서만 Kakao API 추가 호출)
+            road_part = get_road_address_from_kakao(start_address)
+
+            if road_part:
+                # 아까 구해둔 building_name 재사용 (API 호출 절약)
+                retry_address = f"{road_part} {building_name}".strip()
+
+                print(f"   [Retry] 재시도 주소: {retry_address}")
+                dong_list, res_data = get_dong_list_step(token, retry_address)
+            else:
+                print("   [Retry Fail] 도로명 주소를 찾을 수 없음")
+
+        except Exception as e:
+            # Kakao API 장애나 파싱 에러 등으로 멈추지 않도록 처리
+            print(f"   [Error] 재시도 중 주소 변환 오류 발생: {e}")
+
+    # 최종 확인: 그래도 없으면 실패 처리
+    if not dong_list:
+        print("   [Fail] 동 목록 없음 (최종)")
         save_job_log(start_address, status="DATA_NOT_FOUND")
         return
 
@@ -524,55 +491,148 @@ def save_job_log(address, status="DETAIL_SAVED"):
     finally:
         conn.close()
 
+def _collect_exclusive_by_road_address(token, address):
+    """
+    도로명으로 중간 호/층 조회
+    """
+    print(f"      [Work] 도로명으로 전유부(Exclusive) 수집을 시작합니다.")
 
-def get_targets_from_rent_db(limit=100):
+    # 1차 시도: 입력받은 지번 주소로 시도
+    _, road_part, build_part = get_all_address_and_building_from_kakao(address)
+    retry_address = f"{road_part} {build_part}".strip()
+
+    if fetch_target_middle_unit(token, retry_address, address):
+        return True
+
+    print(f"      [Fail] 도로명으로 전유부(Exclusive) 수집에 실패했습니다.")
+    return False
+
+# 각 지역 시군구별 아파트/오피스텔/연립다세대 1건씩 조회 (총 9건)
+def get_targets_from_rent_db(token, search_sgg):
     conn = get_connection()
     cur = conn.cursor()
 
-    # 아파트/오피스텔/연립다세대 랜덤 수집 쿼리 (아파트는 임시로 제외-> 데이터 불균형성 해소 위함)
-    query = """
-        SELECT * FROM (
-            SELECT DISTINCT m.bjdong_name, r.본번, r.부번
-            FROM raw_rent r
-            JOIN meta_bjdong_codes m ON r.시군구 = m.sgg_code AND r.법정동 = m.bjdong_code
-            LEFT JOIN api_job_log log 
-              ON (m.bjdong_name || ' ' || CAST(r.본번 AS INTEGER) || CASE WHEN CAST(r.부번 AS INTEGER) = 0 THEN '' ELSE '-' || CAST(r.부번 AS INTEGER) END) = log.search_address
-              AND log.job_type = 'EXCLUSIVE'
-            WHERE log.search_address IS NULL AND r.건물유형 = '연립다세대'
-            ORDER BY RANDOM() LIMIT 20
-        )
-        UNION ALL
-        SELECT * FROM (
-            SELECT DISTINCT m.bjdong_name, r.본번, r.부번
-            FROM raw_rent r
-            JOIN meta_bjdong_codes m ON r.시군구 = m.sgg_code AND r.법정동 = m.bjdong_code
-            LEFT JOIN api_job_log log 
-              ON (m.bjdong_name || ' ' || CAST(r.본번 AS INTEGER) || CASE WHEN CAST(r.부번 AS INTEGER) = 0 THEN '' ELSE '-' || CAST(r.부번 AS INTEGER) END) = log.search_address
-              AND log.job_type = 'EXCLUSIVE'
-            WHERE log.search_address IS NULL AND r.건물유형 = '오피스텔'
-            ORDER BY RANDOM() LIMIT 20
-        )
-    """
     try:
-        cur.execute(query)
-        rows = cur.fetchall()
-        address_list = []
-        for row in rows:
-            bjdong_name = row[0]
-            bonbeon = int(row[1])
-            bubeon = int(row[2])
-            if bubeon == 0:
-                addr = f"{bjdong_name} {bonbeon}"
+        # [Step 1] 작업할 대상 1개 가져오기 (LRU 방식)
+        # SQLite에서는 ORDER BY ASC 시 NULL(한 번도 안 한 것)이 자동으로 맨 먼저 옵니다.
+        select_sql = """
+            SELECT sgg_code 
+            FROM job_sgg_history
+            WHERE sgg_code= ?
+            ORDER BY last_worked_at ASC
+            LIMIT 1
+        """
+        cur.execute(select_sql, (search_sgg,))
+        row = cur.fetchone()
+        if not row:
+            print("  [Wait] 작업할 대상이 없습니다. 대기 중...")
+            return False  # 대기 신호
+
+        target_sgg = row[0]
+
+        # [Step 2] 상태 'DOING'으로 변경 (Locking)
+        cur.execute("UPDATE job_sgg_history SET status='DOING' WHERE sgg_code=?", (target_sgg,))
+        conn.commit()
+
+        print(f"[{target_sgg}] 데이터 수집 시작...")
+
+        # [Step 3] 실제 랜덤 데이터 조회 (SQLite 문법 적용)
+        # 문자열 연결: || 사용
+        # 랜덤 함수: RANDOM()
+        data_sql = """
+            SELECT * FROM (
+                SELECT 
+                    m.bjdong_name, 
+                    r.본번, 
+                    r.부번, 
+                    r.건물유형,
+                    ROW_NUMBER() OVER (PARTITION BY r.건물유형 ORDER BY RANDOM()) as rn
+                FROM raw_rent r
+                JOIN meta_bjdong_codes m ON r.시군구 = m.sgg_code AND r.법정동 = m.bjdong_code
+                LEFT JOIN api_job_log log 
+                    ON (m.bjdong_name || ' ' || CAST(r.본번 AS INTEGER) || 
+                        CASE WHEN CAST(r.부번 AS INTEGER) = 0 THEN '' ELSE '-' || CAST(r.부번 AS INTEGER) END) 
+                        = log.search_address
+                    AND log.job_type = 'EXCLUSIVE'
+                LEFT JOIN building_info bi
+                    ON r.시군구=SUBSTR(bi.unique_number, 1, 5)
+                    AND r.법정동=SUBSTR(bi.unique_number, 6, 5)
+                    AND r.본번 = SUBSTR(bi.unique_number, 14, 4)
+                    AND r.부번 = SUBSTR(bi.unique_number, 18, 4)
+                WHERE 
+                    r.시군구 = ? 
+                    AND r.건물유형 IN ('아파트', '오피스텔', '연립다세대')
+                    AND log.search_address IS NULL
+                    AND bi.unique_number IS NULL
+            ) sub
+            WHERE rn <= 1
+        """
+
+        # pandas read_sql 실행 (params는 튜플/리스트 형태)
+        df_result = pd.read_sql(data_sql, conn, params=(target_sgg,))
+
+        def make_address(row):
+            """
+            서울특별시 성동구 마장동  0339  0011 를
+            서울특별시 성동구 마장동 339-11 로 변환하는 함수
+            """
+            # 1. 문자를 숫자로 변환하여 앞의 0 제거 ('0128' -> 128)
+            main_num = int(row['본번'])
+            sub_num = int(row['부번'])
+
+            # 2. 지번 생성 (부번이 0이면 본번만, 아니면 본번-부번)
+            if sub_num == 0:
+                jibun = f"{main_num}"
             else:
-                addr = f"{bjdong_name} {bonbeon}-{bubeon}"
-            address_list.append(addr)
-        print(f"수집 대상 {len(address_list)}건 확보")
-        return address_list
+                jibun = f"{main_num}-{sub_num}"
+
+            # 3. 전체 주소 결합
+            return f"{row['bjdong_name']} {jibun}"
+
+        # DataFrame에 새로운 컬럼으로 추가
+        df_result['full_address'] = df_result.apply(make_address, axis=1)
+
+        # 결과 출력 (리스트로 변환하고 싶다면 .tolist() 사용)
+        target_addrs = df_result['full_address'].tolist()
+
+        # API 호출
+        for target_addr in target_addrs:
+            if token:
+                # 중간 동, 중간 호만을 처리
+                _collect_exclusive_by_road_address(token, target_addr)
+            else:
+                print("토큰이 없습니다.")
+                return False
+
+        # [Step 4] 작업 완료 처리 (현재 시간 기록)
+        update_sql = """
+            UPDATE job_sgg_history
+            SET status = 'DONE',
+                last_worked_at = DATETIME('now', 'localtime')
+            WHERE sgg_code = ?
+        """
+        cur.execute(update_sql, (target_sgg,))
+        conn.commit()
+
+        if not df_result.empty:
+            print(f"  -> [{target_sgg}] {len(df_result)}건 처리 및 완료 기록 저장됨.")
+        else:
+            print(f"  -> [{target_sgg}] 수집 대상 없음 (완료 처리됨).")
+
+        return True  # 작업 성공 신호
+
     except Exception as e:
-        print(f"DB 조회 실패: {e}")
-        return []
-    finally:
-        conn.close()
+        print(f"[Error] {e}")
+        conn.rollback()
+        # 에러 발생 시 상태를 FAIL로 변경하고 시간 갱신 (그래야 나중에 다시 시도하거나 후순위로 밀림)
+        if 'target_sgg' in locals():
+            cur.execute("""
+                UPDATE job_sgg_history 
+                SET status='FAIL', last_worked_at=DATETIME('now', 'localtime'), message=? 
+                WHERE sgg_code=?
+            """, (str(e), target_sgg))
+            conn.commit()
+        return False
 
 
 import re
@@ -581,19 +641,41 @@ import urllib.parse
 
 def extract_floor_from_ho_name(ho_name):
     """
-    [Helper] 호수 명칭에서 층수 추출 (예: '1504호' -> 15층)
+    [Helper] 호수 명칭에서 층수 추출
+    Case 1: '1층103호', '1층 103호' -> 명시된 '1' 추출
+    Case 2: '1504호' -> 100으로 나눈 몫 (15층)
+    Case 3: 'B101', '지하' -> 제외 (-1)
     """
-    numbers = re.findall(r'\d+', ho_name)
-    if not numbers: return -1
+    if not ho_name:
+        return -1
 
+    # [전처리] 공백 제거 및 지하/B 확인
+    clean_name = ho_name.replace(" ", "").upper()
+
+    # 1. 지하나 B가 포함되면 무조건 제외 (비즈니스 로직에 따라 다름)
+    if 'B' in clean_name or '지하' in clean_name:
+        return -1
+
+    # 2. [우선순위 1] 'N층' 이라고 명시된 패턴 찾기 (예: 1층103호)
+    # (\d+)층 : 숫자 뒤에 바로 '층'이 오는 경우
+    explicit_floor = re.search(r'(\d+)층', clean_name)
+    if explicit_floor:
+        return int(explicit_floor.group(1))
+
+    # 3. [우선순위 2] 명시된 층이 없으면, 숫자 파싱 (예: 1504호)
+    numbers = re.findall(r'\d+', clean_name)
+    if not numbers:
+        return -1
+
+    # 호명에서 가장 긴 숫자를 호수라고 가정하거나, 맨 앞 숫자를 사용
+    # "1층103호"는 위에서 걸러졌으므로, 여기는 "1504호", "101호" 같은 케이스만 옴
     val = int(numbers[0])
 
-    # 4자리 이상(1001호~)이면 앞자리를 층수로, 3자리(101호~)면 앞자리를 층수로
-    # 보통 100으로 나눈 몫을 층수로 봅니다. (지하 B1 등은 제외)
+    # 4자리 이상(1001호~) 또는 3자리(101호~) -> 앞자리를 층수로
     floor = val // 100
 
-    if 'B' in ho_name or '지' in ho_name or floor == 0:
-        return -1  # 지하나 0층은 제외
+    if floor == 0:
+        return -1  # 0층은 없으므로 제외
 
     return floor
 
@@ -683,14 +765,34 @@ def fetch_target_middle_unit(token, target_address, original_address=None):
     else:
         return False
 
+# 서울, 인천, 경기 지역의 랜덤 순서로 시군구 코드를 반환
+def get_random_sgg_codes():
+    conn = get_connection()
+
+    sql = """
+    SELECT DISTINCT sgg_code
+    FROM meta_bjdong_codes
+    WHERE bjdong_name LIKE '서울%'
+        OR bjdong_name LIKE '인천%'
+        OR bjdong_name LIKE '경기%'
+    ORDER BY RANDOM()
+    """
+
+    df_rows=pd.read_sql(sql,conn)
+
+    result_list = df_rows['sgg_code'].tolist()
+
+    if not result_list:
+        print("  [Wait] 작업할 대상이 없습니다. 대기 중...")
+        return []
+
+    return result_list
+
 if __name__ == "__main__":
     CURRENT_TOKEN = get_access_token()
-    if CURRENT_TOKEN:
-        target_list = get_targets_from_rent_db(limit=60)
-        if not target_list:
-            print("수집할 대상이 없습니다.")
-        else:
-            for idx, target_addr in enumerate(target_list):
-                print(f"\n[{idx + 1}/{len(target_list)}] Target: {target_addr}")
-                collect_apartment_complex(CURRENT_TOKEN, target_addr)
-                time.sleep(1)
+    random_sgg_rows=get_random_sgg_codes()
+
+    for target_sgg in random_sgg_rows:
+        # 루프별로 시군구 지역별 아파트/오피스텔/연립다세대 각 1개씩 조회
+        get_targets_from_rent_db(CURRENT_TOKEN,target_sgg)
+
