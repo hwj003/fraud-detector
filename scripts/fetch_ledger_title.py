@@ -8,11 +8,11 @@ import urllib.parse
 try:
     # 1. 외부(predict.py 등)에서 패키지로 불러올 때 (프로젝트 루트 기준)
     from scripts.db_manager import init_db, get_connection
-    from scripts.kakao_localmap_api import get_building_name_from_kakao
+    from scripts.kakao_localmap_api import get_building_name_from_kakao, get_road_address_from_kakao
 except ModuleNotFoundError:
     # 2. 이 파일을 직접 실행할 때 (현재 폴더 기준)
     from db_manager import init_db, get_connection
-    from kakao_localmap_api import get_building_name_from_kakao
+    from kakao_localmap_api import get_building_name_from_kakao, get_road_address_from_kakao
 load_dotenv()
 # 전유부 (호수별) 데이터 수집 (가격, 소유자)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -21,10 +21,10 @@ DB_PATH = os.path.abspath(os.path.join(BASE_DIR, '..', 'local_fraud_db.sqlite'))
 # ==========================================
 # 1. 설정 (Configuration)
 # ==========================================
-CLIENT_ID = os.getenv("CLIENT_ID_2")
-CLIENT_SECRET = os.getenv("CLIENT_SECRET_2")
-CODEF_USER_ID = os.getenv("CODEF_USER_ID_2")
-CODEF_USER_RSA_PASSWORD = os.getenv("CODEF_USER_RSA_PASSWORD_2")
+CLIENT_ID = os.getenv("CLIENT_ID_1")
+CLIENT_SECRET = os.getenv("CLIENT_SECRET_1")
+CODEF_USER_ID = os.getenv("CODEF_USER_ID_1")
+CODEF_USER_RSA_PASSWORD = os.getenv("CODEF_USER_RSA_PASSWORD_1")
 
 # API 엔드포인트
 TOKEN_URL = "https://oauth.codef.io/oauth/token"
@@ -349,21 +349,18 @@ def get_targets_from_exclusive_db(limit=100):
         conn.close()
 
 
-def collect_title_data(token, start_address):
+def collect_title_data(token, start_address, base_addr):
     """
     2-Way 방식 표제부 수집 로직
     """
-    # 0. 주소 변환
-    building_name = get_building_name_from_kakao(start_address)
-    target_address = f"{start_address} {building_name}"
-    print(f"   [Request] 표제부 조회 시작: {target_address}")
+    print(f"   [Request] 표제부 조회 시작: {start_address}")
 
     # 1. Step 1 호출 (주소 검색)
-    res_step1 = fetch_step1_search(token, target_address)
+    res_step1 = fetch_step1_search(token, start_address)
 
     if not res_step1:
         print("   [Fail] Step 1 응답 없음")
-        return
+        return True
 
     code = res_step1['result']['code']
     data = res_step1.get('data', {})
@@ -374,7 +371,7 @@ def collect_title_data(token, start_address):
     if code == 'CF-00000':
         print("   [Info] 단일 건물 표제부 발견 (즉시 저장)")
         parse_and_save_title(res_step1, start_address)
-        return
+        return True
 
     # ------------------------------------------------------------------
     # Case B: 추가 입력 필요 (CF-03002) -> 동 목록이 온 경우
@@ -392,8 +389,8 @@ def collect_title_data(token, start_address):
 
         if not dong_list:
             print("   [Skip] 동 목록이 비어 있습니다.")
-            save_job_log(start_address, status="DATA_NOT_FOUND")
-            return
+            save_job_log(base_addr, status="DATA_NOT_FOUND")
+            return False
 
         print(f"   [Info] {len(dong_list)}개 동 발견. 상세 수집 시작...")
 
@@ -402,19 +399,21 @@ def collect_title_data(token, start_address):
 
         # 1. 필터링 (비주거용 제외)
         for d in dong_list:
-            d_name = urllib.parse.unquote_plus(d.get('reqDong', '')).strip()
+            # reqDong이 공란일 경우 빈값으로 처리
+            d_val = d.get('reqDong') or ''
+            d_name = urllib.parse.unquote_plus(d_val).strip()
             if any(k in d_name for k in skip_keywords):
                 continue
             valid_dongs.append(d)
 
         if not valid_dongs:
             print("   [Skip] 수집할 주거용 동이 없습니다. (상가단지 등)")
-            save_job_log(start_address, status="NO_RESIDENTIAL_DONG")
-            return
+            save_job_log(base_addr, status="NO_RESIDENTIAL_DONG")
+            return False
 
         # 2. 정렬 및 중간값 선택
         # 동 이름 기준으로 정렬 (101동, 102동...)
-        valid_dongs.sort(key=lambda x: x.get('reqDong'))
+        valid_dongs.sort(key=lambda x: (x.get('reqDong') or ""))
 
         mid_idx = len(valid_dongs) // 2
         target_dong = valid_dongs[mid_idx]  # 표본 동 선택!
@@ -426,7 +425,7 @@ def collect_title_data(token, start_address):
 
         # 3. 선택된 동만 상세 조회 (Step 2 호출)
         res_step2 = fetch_step2_detail(
-            token, jti, job_index, thread_index, two_way_timestamp, target_dong_num, target_address
+            token, jti, job_index, thread_index, two_way_timestamp, target_dong_num, start_address
         )
 
         if res_step2 and res_step2['result']['code'] == 'CF-00000':
@@ -434,7 +433,7 @@ def collect_title_data(token, start_address):
             parse_and_save_title(res_step2, start_address)
 
             print(f"   [Done] '{target_dong_name}' 표제부 수집 완료.")
-            return
+            return True
         else:
             err_msg = res_step2['result']['message'] if res_step2 else 'Error'
             print(f"   [Fail] 수집 실패: {err_msg}")
@@ -446,33 +445,177 @@ def collect_title_data(token, start_address):
     elif code == 'CF-00012':
         print("100회 제한 초과 (CF-00012)")
         sys.exit(0)
+    elif code == 'CF-13006':
+        msg = res_step1['result']['message']
+        print(f"   [Error] API 오류 ({code}): {msg}")
+        return False
     else:
         msg = res_step1['result']['message']
         print(f"   [Error] API 오류 ({code}): {msg}")
-        save_job_log(start_address, status=code)
+        return False
 
-# ==========================================
-# 5. 실행부 (테스트용)
-# ==========================================
-if __name__ == "__main__":
+def _collect_title_with_retry(token, address):
+    """
+    [Internal] 표제부 수집 실행 (지번 시도 -> 실패시 도로명 재시도)
+    성공 시 True, 실패 시 False 반환
+    """
+    print(f"      [Work] 표제부(Title) 수집 시작...")
+
+    # 1차 시도: 입력받은 지번 주소로 시도
+    if collect_title_data(token, address, address):
+        return True
+
+    # 2차 시도: 도로명 주소 + 건물명 조합으로 재시도
+    try:
+        road_part = get_road_address_from_kakao(address)
+        build_part = get_building_name_from_kakao(address)
+        retry_address = f"{road_part} {build_part}".strip()
+
+        print(f"      [Retry] 표제부: 번지 실패 -> 도로명 재시도: {retry_address}")
+        if collect_title_data(token, retry_address, address):
+            return True
+    except Exception as e:
+        print(f"      [Error] 표제부 재시도 주소 생성 실패: {e}")
+
+    return False
+
+
+import pandas as pd
+import os
+import sys
+import time
+from sqlalchemy import text
+from tqdm import tqdm  # 진행률 표시 라이브러리 (없으면 pip install tqdm)
+
+# --- 프로젝트 설정 ---
+current_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.abspath(os.path.join(current_dir, '..'))
+sys.path.append(project_root)
+
+from app.core.config import engine
+from scripts.fetch_ledger_title import collect_title_data  # 표제부 수집 함수 임포트
+from scripts.fetch_ledger_exclusive import get_access_token  # 토큰 발급 함수
+
+
+def fetch_missing_titles():
+    print("--- [Start] 표제부(Title) 누락 데이터 수집 시작 ---")
+
+    # 1. 누락된 PNU 조회
+    print(">> 1. 누락 데이터 조회 중...")
+
+    query = """
+        SELECT DISTINCT 
+            SUBSTR(b.unique_number, 1, 10) as bjd, 
+            SUBSTR(b.unique_number, 14, 8) as bunji, 
+            MAX(b.lot_address) as address,                -- API 호출용 지번 주소
+            MAX(b.road_address) as road_address           -- API 호출용 도로명 주소
+        FROM building_info b
+        LEFT JOIN building_title_info t 
+            ON SUBSTR(b.unique_number, 1, 21) = t.unique_number
+        WHERE t.unique_number IS NULL       -- 표제부에 없는 경우
+          AND b.unique_number IS NOT NULL   
+          AND LENGTH(b.unique_number) >= 19 -- 유효한 PNU 길이 확인
+          AND SUBSTR(b.unique_number, 1, 5) = '28237'
+        GROUP BY SUBSTR(b.unique_number, 1, 19)
+    """
+
+    try:
+        df_missing = pd.read_sql(query, engine)
+    except Exception as e:
+        print(f"❌ DB 조회 실패: {e}")
+        return
+
+    total_cnt = len(df_missing)
+    if total_cnt == 0:
+        print("✅ 모든 데이터가 표제부를 가지고 있습니다. (누락 없음)")
+        return
+
+    print(f"-> 총 {total_cnt}건의 건물 표제부가 누락되었습니다.")
+    print(">> 2. API 수집 시작...")
+
+    # 2. 토큰 발급
     token = get_access_token()
+    if not token:
+        print("❌ API 토큰 발급 실패. 종료합니다.")
+        return
 
-    if token:
-        target_list = get_targets_from_exclusive_db(limit=100)
+    success_cnt = 0
+    fail_cnt = 0
 
-        if not target_list:
-            print("모든 데이터가 최신이거나, 수집할 대상이 없습니다.")
+    # 3. 순회하며 수집
+    # tqdm을 사용하여 진행바 표시
+    for idx, row in tqdm(df_missing.iterrows(), total=total_cnt, desc="Collecting"):
+        bjd = row['bjd']
+        bunji = row['bunji']
 
-        for idx, target_addr in enumerate(target_list):
-            print(f"\n===============================================================")
-            print(f"[진행률 {idx + 1}/{len(target_list)}] Target: {target_addr}")
-            print(f"===============================================================")
+        target_addr=convert_code_to_address(bjd, bunji)
+        try:
+            # 표제부 수집 함수 호출 (기존 모듈 활용)
+            _collect_title_with_retry(token, target_addr)
 
-            # 표제부 데이터 수집
-            collect_title_data(token, target_addr)
+            # API 부하 방지를 위한 미세 딜레이 (필요 시 조절)
+            time.sleep(0.1)
 
-            # 건물이 바뀔 때마다 잠시 휴식 (API 보호)
-            time.sleep(1)
+        except Exception as e:
+            print(f"\n[Error]({target_addr}) 처리 중 오류: {e}")
+            fail_cnt += 1
 
-    else:
-        print("토큰 발급 실패. 설정을 확인하세요.")
+    print("\n" + "=" * 50)
+    print(f"🏁 수집 완료")
+    print(f"   - 대상: {total_cnt}건")
+    print(f"   - 성공: {success_cnt}건")
+    print(f"   - 실패: {fail_cnt}건")
+    print("=" * 50)
+
+
+def convert_code_to_address(bjd, bunji):
+    """
+    입력: "2823710100 00100272" (법정동코드10자리 + 지번8자리)
+    출력: "인천광역시 부평구 부평동 10-272"
+    동작: meta_bjdong_codes 테이블을 조회하여 주소명을 완성함
+    """
+    try:
+
+        # 2. 시군구/법정동 코드 분리
+        sgg_code = bjd[0:5]  # '2823710100'
+        bjdong_code= bjd[5:10]
+        # 3. DB 조회 (meta_bjdong_codes 테이블)
+        # 컬럼명이 sgg_name, bjdong_name 이라고 가정합니다.
+        # 실제 테이블의 컬럼명에 맞춰 수정해주세요 (예: 법정동명 등)
+        query = text("""
+            SELECT bjdong_name
+            FROM meta_bjdong_codes
+            WHERE sgg_code = :sgg_code 
+              AND bjdong_code = :bjdong_code
+            LIMIT 1
+        """)
+
+        with engine.connect() as conn:
+            result = conn.execute(query, {"sgg_code": sgg_code, "bjdong_code": bjdong_code}).fetchone()
+
+        if not result:
+            return f"주소 정보 없음 (Code: {sgg_code})"
+
+        # 4. 주소 문자열 조합 (None 방지 처리)
+        region_name = result.bjdong_name.strip()  # 공백 제거
+
+        # 5. 본번/부번 파싱 (00100272 -> 10-272)
+        if len(bunji) == 8:
+            bon = int(bunji[:4])
+            bu = int(bunji[4:])
+
+            if bu > 0:
+                jibun = f"{bon}-{bu}"
+            else:
+                jibun = f"{bon}"
+        else:
+            jibun = bunji
+
+        # 6. 최종 반환
+        return f"{region_name} {jibun}"
+
+    except Exception as e:
+        return f"변환 중 오류 발생: {e}"
+
+if __name__ == "__main__":
+    fetch_missing_titles()
