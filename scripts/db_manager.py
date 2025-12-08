@@ -104,17 +104,6 @@ def init_db():
     ''')
 
     cur.execute('''
-        CREATE TABLE IF NOT EXISTS api_job_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            search_address VARCHAR(255) UNIQUE, -- 중복 수집 방지
-            job_type VARCHAR(20) DEFAULT 'EXCLUSIVE', -- 작업 유형 ('EXCLUSIVE', 'TITLE')
-            status VARCHAR(50),                 -- 작업 상태 (DETAIL_SAVED 등)
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-    ''')
-
-    cur.execute('''
         CREATE TABLE IF NOT EXISTS building_title_info (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
 
@@ -160,6 +149,51 @@ def init_db():
             PRIMARY KEY (sigungu_code, deal_ymd, data_type)
         );
     ''')
+
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS job_sgg_history (
+            sgg_code VARCHAR(10) PRIMARY KEY,
+            status VARCHAR(20) DEFAULT 'READY',  -- READY, DOING, DONE(혹은 FINISHED)
+            last_worked_at TIMESTAMP,            -- 이 시간이 가장 옛날인 것부터 다시 시작
+            message TEXT                         -- 결과 메시지 등
+        );
+    ''')
+
+    # 2. 초기 데이터 동기화 (없는 지역만 추가)
+    # MySQL의 INSERT IGNORE와 유사한 SQLite 문법
+    cur.execute("""
+        INSERT OR IGNORE INTO job_sgg_history (sgg_code, status)
+        SELECT DISTINCT sgg_code, 'READY'
+        FROM meta_bjdong_codes
+        WHERE sgg_code IS NOT NULL;
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS risk_analysis_result (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+    
+            address_key VARCHAR(255),       -- 시군구+법정동+본번+부번 (Join용 Key)
+            building_info_id INT,           -- building_info 테이블 FK
+            
+            -- 2. 핵심 분석 지표 (숫자)
+            jeonse_ratio DECIMAL(5, 2),     -- 전세가율 (예: 0.85)
+            hug_safe_limit BIGINT,
+            hug_risk_ratio DECIMAL(5, 2),   -- HUG 기준 위험도
+            total_risk_ratio DECIMAL(5, 2), -- 깡통전세(부채포함) 위험도
+            estimated_loan_amount BIGINT,   -- 시뮬레이션된 선순위 대출금
+            
+            -- 3. 최종 판단 결과
+            risk_level VARCHAR(20),         -- 'SAFE', 'RISKY'
+            risk_score INT,                 -- 100점 만점 환산 점수
+            
+            -- 4. 언제 분석했는가?
+            analyzed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            
+            -- (옵션) 빠른 조회를 위한 인덱스
+            INDEX idx_address (address_key),
+            INDEX idx_risk_level (risk_level)
+        );
+    """)
     conn.commit()
     conn.close()
     print("[DB Manager] 테이블 점검 완료")
