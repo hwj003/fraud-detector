@@ -20,7 +20,7 @@ def read_root():
 async def post_predict(features: PredictionRequest):
     """
     - **address**: 등기부등본상 도로명/지번 주소 (예: 인천 부평구 산곡동 145)
-    - **deposit**: 전세 보증금 액수 (단위: 원, 예: 200000000)
+    - **deposit**: 전세 보증금 액수 (단위: 만원, 예: 20000)
     """
     result = predict_risk(features.address, features.deposit)
 
