@@ -5,7 +5,7 @@ import os, sys, time
 from datetime import datetime
 from sqlalchemy import text
 from functools import lru_cache
-
+from db_manager import get_connection
 # --- 프로젝트 경로 및 엔진 ---
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.append(project_root)
@@ -70,6 +70,16 @@ def parse_rent_xml_to_df(xml_text: str, code_map: dict, building_type: str) -> p
     items = root.findall('.//item')
     if not items: return pd.DataFrame()
 
+    # 1. 건물 유형별 태그 매핑 - 오피스텔 offiNm, 아파트 aptNm, 연립다세대 mhouseNm
+    # 기본값은 'aptNm'으로 하되, 유형에 따라 변경
+    name_tag = 'aptNm'
+    if building_type == '오피스텔':
+        name_tag = 'offiNm'
+    elif building_type == '연립다세대':
+        name_tag = 'mhouseNm'
+    elif building_type == '아파트':
+        name_tag = 'aptNm'
+
     records = []
     for item in items:
         bonbeon, bubeon = '0000', '0000'
@@ -106,7 +116,10 @@ def parse_rent_xml_to_df(xml_text: str, code_map: dict, building_type: str) -> p
             '계약일': deal_date,
             '계약유형': item.findtext('contractType').strip(),
             '건물유형': building_type,
-            '층': floor_str
+            '층': floor_str,
+            '전용면적': item.findtext('excluUseAr'),
+            '건물명': item.findtext(name_tag),  # 또는 bldgNm
+            '건축년도': item.findtext('buildYear')
         }
         records.append(record)
     return pd.DataFrame(records)
