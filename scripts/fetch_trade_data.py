@@ -15,9 +15,9 @@ from app.core.config import engine, load_dotenv
 load_dotenv()
 API_SERVICE_KEY = os.getenv("API_SERVICE_KEY")
 API_URLS_TRADE = {
-    "APT": "https://apis.data.go.kr/1613000/RTMSDataSvcAptTrade/getRTMSDataSvcAptTrade",
-    "RH": "https://apis.data.go.kr/1613000/RTMSDataSvcRHTrade/getRTMSDataSvcRHTrade", # 연립다세대
-    "OFFI": "https://apis.data.go.kr/1613000/RTMSDataSvcOffiTrade/getRTMSDataSvcOffiTrade" # 오피스텔
+    "아파트": "https://apis.data.go.kr/1613000/RTMSDataSvcAptTrade/getRTMSDataSvcAptTrade",
+    "연립다세대": "https://apis.data.go.kr/1613000/RTMSDataSvcRHTrade/getRTMSDataSvcRHTrade", # 연립다세대
+    "오피스텔": "https://apis.data.go.kr/1613000/RTMSDataSvcOffiTrade/getRTMSDataSvcOffiTrade" # 오피스텔
 }
 TRADE_TABLE_NAME = "raw_trade"
 REGION_TABLE_NAME = "meta_sgg_codes"
@@ -66,7 +66,7 @@ def get_bjdong_code_map() -> dict:
 
 
 # --- 1. XML 파싱 함수 ---
-def parse_trade_xml_to_df(xml_text: str, code_map: dict) -> pd.DataFrame:
+def parse_trade_xml_to_df(xml_text: str, code_map: dict, building_type: str) -> pd.DataFrame:
     """매매 실거래가 API의 XML 응답을 DataFrame으로 파싱합니다."""
     try:
         root = ET.fromstring(xml_text)
@@ -75,6 +75,16 @@ def parse_trade_xml_to_df(xml_text: str, code_map: dict) -> pd.DataFrame:
     if root.findtext('.//resultCode', '99') not in ('00', '000'): return pd.DataFrame()
     items = root.findall('.//item')
     if not items: return pd.DataFrame()
+
+    # 1. 건물 유형별 태그 매핑 - 오피스텔 offiNm, 아파트 aptNm, 연립다세대 mhouseNm
+    # 기본값은 'aptNm'으로 하되, 유형에 따라 변경
+    name_tag = 'aptNm'
+    if building_type == '오피스텔':
+        name_tag = 'offiNm'
+    elif building_type == '연립다세대':
+        name_tag = 'mhouseNm'
+    elif building_type == '아파트':
+        name_tag = 'aptNm'
 
     records = []
     for item in items:
@@ -90,7 +100,7 @@ def parse_trade_xml_to_df(xml_text: str, code_map: dict) -> pd.DataFrame:
             if len(parts) > 1:
                 bubeon = parts[1].lstrip('0').strip().zfill(4) or '0000'
         deal_date = f"{item.findtext('dealYear', '')}{item.findtext('dealMonth', '').zfill(2)}{item.findtext('dealDay', '').zfill(2)}"
-        deal_amount_str = item.findtext('dealAmount', '0').replace(',', '').strip()
+        deal_amount = item.findtext('dealAmount', '0').replace(',', '').strip()
 
         # 이름(umdNm) -> 코드(bjdongCd) 변환
         sgg_code = item.findtext('sggCd').strip()
@@ -108,8 +118,13 @@ def parse_trade_xml_to_df(xml_text: str, code_map: dict) -> pd.DataFrame:
             '법정동': bjdong_code,
             '본번': bonbeon,
             '부번': bubeon,
-            '거래금액(만원)': deal_amount_str,
-            '계약일': deal_date
+            '거래금액': deal_amount,
+            '계약일': deal_date,
+            '전용면적': item.findtext('excluUseAr'),
+            '층': item.findtext('floor'),
+            '건물명': item.findtext(name_tag),
+            '건축년도': item.findtext('buildYear'),
+            '건물유형': building_type
         }
         records.append(record)
     return pd.DataFrame(records)
@@ -129,7 +144,7 @@ def fetch_trade_data_and_save(lawd_cd: str, deal_ymd: str, code_map: dict) -> bo
             response.raise_for_status()
 
             # 공통 파싱 함수 사용
-            df_api_data = parse_trade_xml_to_df(response.text, code_map)
+            df_api_data = parse_trade_xml_to_df(response.text, code_map, building_type)
 
             if not df_api_data.empty:
                 print(f"  -> {building_type}: {len(df_api_data)} 건 수집됨.")
