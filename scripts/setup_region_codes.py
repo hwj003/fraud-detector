@@ -3,18 +3,14 @@ import sys
 import os
 from sqlalchemy.types import String
 from datetime import datetime
-from dateutil.relativedelta import relativedelta # 날짜 계산용
-
+from db_manager import get_connection
 # 중앙 설정 파일(engine) 임포트
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.append(project_root)
 from app.core.config import engine
 
 # 특정 시군구 코드 수집을 위한 배열
-TARGET_SGG_CODES = [
-    '28237'
-    # (나중에 서울 강서구 '11500' 등을 이곳에 추가)
-]
+TARGET_SGG_CODES = []
 
 # --- 설정 ---
 # 1. 원본 법정동 코드 CSV 파일 경로
@@ -117,6 +113,28 @@ def setup_region_database():
     except Exception as e:
         print(f"[오류] DB 저장 실패: {e}")
 
+# 서울, 인천, 경기 지역의 시군구 코드를 반환
+def get_sgg_codes():
+    conn = get_connection()
+
+    sql = """
+    SELECT DISTINCT sgg_code
+    FROM meta_bjdong_codes
+    WHERE bjdong_name LIKE '서울%'
+        OR bjdong_name LIKE '인천%'
+        OR bjdong_name LIKE '경기%'
+    """
+
+    df_rows=pd.read_sql(sql,conn)
+
+    result_list = df_rows['sgg_code'].tolist()
+
+    if not result_list:
+        print("  [Wait] 작업할 대상이 없습니다. 대기 중...")
+        return []
+
+    return result_list
 
 if __name__ == "__main__":
+    TARGET_SGG_CODES = get_sgg_codes()
     setup_region_database()
