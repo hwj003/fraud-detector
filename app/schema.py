@@ -13,7 +13,7 @@ class PredictionRequest(BaseModel):
     )
     deposit: int = Field(
         ...,
-        description="계약하려는 전세 보증금 액수 (단위: 원, 예: 200000000)"
+        description="계약하려는 전세 보증금 액수 (단위: 만원, 예: 20000)"
     )
 
     class Config:
@@ -60,9 +60,9 @@ class PredictionResponse(BaseModel):
         ...,
         description="AI 모델이 예측한 전세사기 위험 확률 (0 ~ 100점)"
     )
-    risk_level: Literal['SAFE', 'RISKY'] = Field(
+    risk_level: Literal['SAFE', 'CAUTION', 'RISKY'] = Field(
         ...,
-        description="위험 등급 (SAFE: 안전, RISKY: 위험)"
+        description="위험 등급 (SAFE: 안전, CAUTION: 주의, RISKY: 위험)"
     )
 
     details: RiskDetails = Field(..., description="상세 분석 지표")
