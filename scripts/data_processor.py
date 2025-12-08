@@ -188,8 +188,14 @@ def load_and_engineer_features() -> pd.DataFrame:
                       보증금 AS RENT_PRICE, \
                       월세  AS MONTHLY_RENT, \
                       계약일 AS CONTRACT_DATE, \
-                      층 AS FLOOR
+                      건물유형 AS BUILDING_TYPE, \
+                      층 AS FLOOR, \
+                      전용면적 AS AREA, \
+                      건물명 AS BUILDING_NAME, \
+                      건축년도 AS BUILDING_YEAR
                FROM raw_rent \
+               WHERE 월세 = 0
+                 AND 계약일 >= '20230101' -- 최근 2년 데이터만 사용
                """
 
     # 1-2. 매매 실거래가 (Market Price Reference)
@@ -198,9 +204,13 @@ def load_and_engineer_features() -> pd.DataFrame:
                        법정동, \
                        본번, \
                        부번, \
-                       `거래금액(만원)` AS TRADE_PRICE, \
-                       계약일        AS TRADE_DATE
+                       거래금액 AS TRADE_PRICE, \
+                       계약일  AS TRADE_DATE, \
+                       전용면적 AS AREA, \
+                       건축년도 AS BUILDING_AGE, \
+                       건물유형 AS BUILDING_TYPE
                 FROM raw_trade \
+                WHERE 계약일 >= '20230101' -- 최근 2년 데이터만 사용
                 """
 
     # 1-3. 건축물대장 정보
@@ -209,12 +219,13 @@ def load_and_engineer_features() -> pd.DataFrame:
                           unique_number,
                           lot_address,
                           main_use,
-                          exclusive_area,
+                          exclusive_area AS AREA,
                           owner_name,
                           ownership_changed_date,
                           detail_address,
                           is_violating_building
                    FROM building_info
+                   WHERE unique_number IS NOT NULL
                    """
 
     # 1-4. 공시가격 히스토리
@@ -227,7 +238,9 @@ def load_and_engineer_features() -> pd.DataFrame:
 
     # 1-5. 집합 건축물대장 표제부
     SQL_TITLE = """
-                    SELECT sigungu_code, bjdong_code, bunji,
+                    SELECT 
+                           unique_number,
+                           sigungu_code, bjdong_code, bunji,
                            household_cnt,      -- 총 세대수
                            parking_cnt,        -- 주차대수
                            elevator_cnt,       -- 승강기대수
@@ -247,57 +260,48 @@ def load_and_engineer_features() -> pd.DataFrame:
         print(f"DB 쿼리 중 치명적 오류 발생: {e}")
         raise
 
-    print("--- 2. 데이터 정제 및 타입 변환 ---")
+    print("--- 2. 데이터 정제 및 키 생성 ---")
 
-    # 2-1. 가격 변환
+    # 숫자형 변환
     df_rent['RENT_PRICE'] = pd.to_numeric(df_rent['RENT_PRICE'], errors='coerce')
-    df_rent['MONTHLY_RENT'] = pd.to_numeric(df_rent['MONTHLY_RENT'].fillna(0), errors='coerce')
     df_trade['TRADE_PRICE'] = pd.to_numeric(df_trade['TRADE_PRICE'], errors='coerce')
+    df_rent['AREA'] = pd.to_numeric(df_rent['AREA'], errors='coerce')
+    df_building['AREA'] = pd.to_numeric(df_building['AREA'], errors='coerce')
     df_price['PUBLIC_PRICE'] = pd.to_numeric(df_price['PUBLIC_PRICE'], errors='coerce') / 10000
 
-    # 층수(FLOOR) 정수형 변환 (소수점 제거)
-    df_rent['FLOOR'] = pd.to_numeric(df_rent['FLOOR'], errors='coerce').fillna(0).astype(int)
-
-    # 2-2. 날짜 변환
+    # 날짜형 변환
     df_rent['CONTRACT_DATE'] = pd.to_datetime(df_rent['CONTRACT_DATE'], errors='coerce')
     df_trade['TRADE_DATE'] = pd.to_datetime(df_trade['TRADE_DATE'], errors='coerce')
     df_price['PRICE_DATE'] = pd.to_datetime(df_price['PRICE_DATE'], errors='coerce')
-    df_title['use_apr_day'] = pd.to_datetime(df_title['use_apr_day'], errors='coerce')
     df_building['ownership_changed_date'] = pd.to_datetime(df_building['ownership_changed_date'], errors='coerce')
 
-    # 전세계약 필터링
-    df_rent = df_rent[df_rent['MONTHLY_RENT'] == 0].copy()
-    df_rent = df_rent.dropna(subset=['CONTRACT_DATE', 'RENT_PRICE'])
-    df_price = df_price.sort_values('PRICE_DATE')
-
-    # 키 생성
-    df_rent['key'] = df_rent.apply(_create_join_key_from_columns, axis=1)
-    df_trade['key'] = df_trade.apply(_create_join_key_from_columns, axis=1)
-    df_title['key'] = df_title.apply(_create_join_key_for_title, axis=1)
+    # 키 생성 (개선된 함수 사용)
+    col_map = {'sgg': '시군구', 'bjd': '법정동', 'bon': '본번', 'bu': '부번'}
+    df_rent['key'] = df_rent.apply(lambda row: _create_join_key_from_columns(row), axis=1)
+    df_trade['key'] = df_trade.apply(lambda row: _create_join_key_from_columns(row), axis=1)
     df_building['key'] = df_building['unique_number'].apply(_create_join_key_from_unique_no)
-    # 3-3. 키 없는 데이터 제거 및 중복 제거
-    df_rent = df_rent.dropna(subset=['key'])
-    df_trade = df_trade.dropna(subset=['key']).sort_values('TRADE_DATE')
 
-    # 중복 키 제거 (가장 최신 정보만 남김)
-    df_rent = df_rent.dropna(subset=['key'])
-    df_trade = df_trade.dropna(subset=['key']).sort_values(by='TRADE_DATE')
-    df_building = df_building.dropna(subset=['key']).drop_duplicates(subset=['key'], keep='last')
-    # 표제부는 동별 데이터이므로 키 중복 제거 (가장 최신 정보 유지)
-    df_title = df_title.dropna(subset=['key']).drop_duplicates(subset=['key'], keep='last')
+    # 유효한 키만 남기기
+    df_rent = df_rent.dropna(subset=['key', 'RENT_PRICE'])
+    df_building = df_building.dropna(subset=['key'])
 
-    # 건축물대장 데이터에서 층수 추출
-    df_building['FLOOR'] = df_building['detail_address'].apply(_extract_floor_from_detail)
+    # 표제부(사용승인일)를 building_info에 미리 결합 (19자리 PNU 기준)
+    # df_title의 unique_number가 19자리라고 가정
+    df_building['pnu_19'] = df_building['unique_number'].astype(str).str.slice(0, 19)
+    df_title['pnu_19'] = df_title['unique_number'].astype(str).str.slice(0, 19)
 
-    # 층수 추출 실패한 데이터(None)는 삭제 처리
-    df_building = df_building.dropna(subset=['FLOOR'])
-    df_building['FLOOR'] = df_building['FLOOR'].astype(int)
+    # 중복 제거 (건물당 1개)
+    df_title = df_title.drop_duplicates(subset=['pnu_19'])
+    df_building = pd.merge(df_building, df_title[['pnu_19', 'use_apr_day']], on='pnu_19', how='left')
 
-    print("--- 4. 데이터 결합 (Merge) ---")
+    print("--- 3. 데이터 결합 및 필터링 (Merge & Filter) ---")
 
-    # 4-1. 전세(Rent) + 매매(Trade) 결합 (시세 비교용)
+    # (1) 전세 + 매매 (merge_asof: 날짜 근접 매칭)
+    df_rent = df_rent.sort_values('CONTRACT_DATE')
+    df_trade = df_trade.sort_values('TRADE_DATE')
+
     df_merged = pd.merge_asof(
-        df_rent.sort_values('CONTRACT_DATE'),
+        df_rent,
         df_trade[['key', 'TRADE_PRICE', 'TRADE_DATE']],
         left_on='CONTRACT_DATE',
         right_on='TRADE_DATE',
@@ -306,208 +310,144 @@ def load_and_engineer_features() -> pd.DataFrame:
         tolerance=pd.Timedelta(days=365 * 2)  # 2년 내 매매가 참조
     )
 
-    # 4-2. 전세 + 건축물대장 결합
-    df_merged = pd.merge(df_merged, df_building, on=['key', 'FLOOR'], how='inner')
+    # (2) 전세 + 건축물대장 (Left Join)
+    # 학습용이므로, 건물이 매칭된 데이터만 살립니다 (Inner Join과 유사 효과를 위해 dropna)
+    df_merged = pd.merge(df_merged, df_building, on='key', how='left', suffixes=('', '_BUILD'))
 
-    # 4-2-B. 전세 + 표제부(Title Info) 결합
-    # 이제 나이, 세대수, 주차장 정보는 여기서 옵니다.
-    df_merged = pd.merge(df_merged, df_title.drop(columns=['sigungu_code', 'bjdong_code', 'bunji']), on='key', how='left')
+    # 건축물대장 정보가 없는 데이터 삭제 (분석 불가)
+    df_merged = df_merged.dropna(subset=['building_info_id'])
 
-    # 4-3. 전세 + 공시가격
-    df_merged_with_id = df_merged.dropna(subset=['building_info_id']).sort_values('CONTRACT_DATE')
-    df_merged_with_id['building_info_id'] = df_merged_with_id['building_info_id'].astype(int)
+    # [핵심] 면적 오차 필터링 (Area Mismatch Removal)
+    # 아파트 전세가(30평)가 빌라 건물(10평)에 붙는 오류 제거
+    # 오차 범위: 3.3m² (1평) 미만인 것만 유효
+    df_merged['area_diff'] = abs(df_merged['AREA'] - df_merged['AREA_BUILD'])
 
-    # 공시가격 붙이기 (계약일 기준 가장 최근 공시가격)
-    df_final_temp = pd.merge_asof(
-        df_merged_with_id,
-        df_price[['building_info_id', 'PUBLIC_PRICE', 'PRICE_DATE']],
+    initial_count = len(df_merged)
+    df_merged = df_merged[df_merged['area_diff'] < 3.3].copy()
+    print(f"-> 면적 불일치 데이터 {initial_count - len(df_merged)}건 제거됨")
+
+    df_merged['building_info_id'] = df_merged['building_info_id'].astype(int)
+    df_price['building_info_id'] = df_price['building_info_id'].astype(int)
+
+    # (3) 공시지가 결합
+    df_price = df_price.sort_values('PRICE_DATE')
+    df_merged = pd.merge_asof(
+        df_merged.sort_values('CONTRACT_DATE'),
+        df_price,
         left_on='CONTRACT_DATE',
         right_on='PRICE_DATE',
         by='building_info_id',
         direction='backward'
     )
 
-    df_merged = df_final_temp
+    print("--- 4. 파생변수 생성 및 시뮬레이션 (Modified) ---")
 
-    # 시각화에 필요한 원본 칼럼들을 미리 복사해서 df_final 생성
-    required_cols = [
-        'RENT_PRICE', 'TRADE_PRICE', 'PUBLIC_PRICE', 'ESTIMATED_MARKET_PRICE',
-        'CONTRACT_DATE', 'main_use', 'building_info_id',
-        'household_cnt', 'parking_cnt', 'elevator_cnt', 'use_apr_day',
-        'owner_name', 'ownership_changed_date'
-    ]
-    # 존재하는 칼럼만 복사 (오류 방지)
-    existing_cols = [col for col in required_cols if col in df_merged.columns]
-    df_final = df_merged[existing_cols].copy()
+    # 4-1. 시세 추정
+    def estimate_market_price(row):
+        if pd.notna(row['TRADE_PRICE']) and row['TRADE_PRICE'] > 0:
+            return row['TRADE_PRICE']
+        if pd.notna(row['PUBLIC_PRICE']) and row['PUBLIC_PRICE'] > 0:
+            m_use = str(row['main_use'])
+            if any(x in m_use for x in ['다세대', '오피스텔', '연립', '근린']):
+                return row['PUBLIC_PRICE'] * 1.8
+            return row['PUBLIC_PRICE'] * 1.5
+        return np.nan
 
-    # (1) 전세가율 (jeonse_ratio)
-    # 매매가가 없으면 공시가격 * 1.4배를 추정 시세로 사용
-    df_merged['ESTIMATED_MARKET_PRICE'] = df_merged['TRADE_PRICE'].fillna(df_merged['PUBLIC_PRICE'] * 1.4)
-    df_final['ESTIMATED_MARKET_PRICE'] = df_merged['ESTIMATED_MARKET_PRICE']
+    df_merged['ESTIMATED_MARKET_PRICE'] = df_merged.apply(estimate_market_price, axis=1)
+    df_merged = df_merged.dropna(subset=['ESTIMATED_MARKET_PRICE'])
 
-    df_final['jeonse_ratio'] = df_merged['RENT_PRICE'] / df_merged['ESTIMATED_MARKET_PRICE']
-    # 0으로 나누는 경우(inf, -inf)를 처리하기 위해 replace 추가
-    df_final['jeonse_ratio'] = df_final['jeonse_ratio'].replace([np.inf, -np.inf], 5.0).fillna(0).clip(0, 1.5)
+    # 4-2. 전세가율
+    df_merged['jeonse_ratio'] = df_merged['RENT_PRICE'] / df_merged['ESTIMATED_MARKET_PRICE']
+    valid_mask = df_merged['jeonse_ratio'] < 2.0
+    df_final = df_merged[valid_mask].copy()
 
-    # (2) HUG 보증보험 기준 위험도 (Rent  / (Public Price * 126%))
-    # 가입한도 = (공시가격 * 140%) * 90%
-    # 이 값이 1.0을 넘으면 보증보험 가입 불가 = 고위험
-    hug_limit = df_merged['PUBLIC_PRICE'] * 1.26
-    df_final['hug_risk_ratio'] = df_merged['RENT_PRICE'] / hug_limit
-    df_final['hug_risk_ratio'] = df_final['hug_risk_ratio'].replace([np.inf, -np.inf], 5.0).fillna(0)
-
-    # (3) 위반건축물 여부 (전유부 위반 OR 표제부 위반)
-    # 하나라도 'Y'면 위반으로 간주
-    is_vio_exclusive = df_merged['is_violating_building'].apply(lambda x: 1 if str(x).strip().upper() == 'Y' else 0)
-    is_vio_title = df_merged['title_violation'].apply(lambda x: 1 if str(x).strip().upper() == 'Y' else 0)
-    df_final['is_illegal_building'] = ((is_vio_exclusive == 1) | (is_vio_title == 1)).astype(int)
-
-    # (4) 건물 나이 (표제부 use_apr_day 기준)
-    df_final['building_age'] = (df_merged['CONTRACT_DATE'] - df_merged['use_apr_day']).dt.days / 365.25
-    df_final['building_age'] = df_final['building_age'].fillna(0).clip(0, 50)  # 데이터 없으면 0 처리
-
-    # (5) 세대당 주차대수 (Parking per Household)
-    # 주차난이 심할수록(0.5대 미만) 가격 방어가 안 되므로 리스크 요인
-    df_final['parking_per_household'] = df_merged['parking_cnt'] / df_merged['household_cnt']
-    df_final['parking_per_household'] = df_final['parking_per_household'].replace([np.inf, -np.inf], 0).fillna(0)
-
-    # (6) 나홀로 아파트 여부 (Scale Risk)
-    # 100세대 미만이면 1, 아니면 0 (환금성 리스크)
-    df_final['is_micro_complex'] = df_merged['household_cnt'].apply(lambda x: 1 if x < 100 else 0)
-
-    # (7) 주용도 (building_use) - 원-핫 인코딩용
-    df_merged['main_use'] = df_merged['main_use'].fillna('기타')
-
-    # 2. 명칭 통일 로직 (포함 여부로 판단)
-    def standardize_building_type(x):
-        s = str(x)
-        if '아파트' in s: return '아파트'  # 공동주택(아파트) -> 아파트
-        if '오피스텔' in s: return '오피스텔'  # 업무시설(오피스텔) -> 오피스텔
-        if '다세대' in s: return '다세대주택'
-        if '연립' in s: return '연립주택'
-        # 근린생활시설 관련 키워드 통합
-        if any(c in s for c in ['근린', '소매', '사무', '점포']): return '근린생활시설'
-        return '기타'
-
-    df_merged['main_use'] = df_merged['main_use'].apply(standardize_building_type)
-
-    df_final['main_use'] = df_merged['main_use']
-
-    categories = ['아파트', '다세대주택', '오피스텔', '근린생활시설', '기타']
-    df_merged['cat_use'] = pd.Categorical(df_merged['main_use'], categories=categories).fillna('기타')
-
-    df_processed = pd.get_dummies(df_merged['cat_use'], prefix='use', drop_first=False)
-    df_final = pd.concat([df_final, df_processed], axis=1)
-
-    # [가상 선순위 대출 시뮬레이션]
-    # 근거: 국토교통부 전세사기 피해 실태조사 보고서 (2025.06)
-
-    # 0. 기본 불확실성
-    # 모든 집에 대출이 있을 수도, 없을 수도 있다는 현실적 불확실성 반영 (0~20%)
-    base_loan_ratio = np.random.uniform(0, 0.2, size=len(df_merged))
-
-    # Logic 1: 건물 유형 가중치 (Type Weight)
-    # 근거: 피해자의 86%가 비아파트(다세대, 오피스텔)에 집중됨. 아파트는 안전.
-    type_weight = df_merged['main_use'].apply(
-        lambda x: 0.2 if any(c in str(x) for c in ['다세대', '오피스텔', '근린', '연립']) else 0.0
+    # 4-3. HUG 위험도
+    filled_public = df_final['PUBLIC_PRICE'].fillna(df_final['ESTIMATED_MARKET_PRICE'] * 0.7)
+    hug_limit = filled_public * 1.26
+    df_final['hug_risk_ratio'] = df_final.apply(
+        lambda x: x['RENT_PRICE'] / hug_limit[x.name] if hug_limit[x.name] > 0 else 0, axis=1
     )
 
-    # Logic 2: 가격 역상관성 가중치 (Price Inverse Weight)
-    # 근거: 피해 보증금의 97%가 3억 원 이하 저가 주택. (무자본 갭투자 타겟)
-    # 하위 30% 가격대 매물에 대해 대출 위험도 추가
-    price_threshold_low = df_merged['ESTIMATED_MARKET_PRICE'].quantile(0.3)
+    # 4-4. [수정됨] 위험 요소 점수화 (Feature Engineering)
+    # 이 값들을 더 이상 '대출금'으로 환산해서 빚에 더하지 않습니다.
+    # 대신 AI가 학습할 '특징(Feature)'으로만 남겨둡니다.
 
-    price_weight = df_merged['ESTIMATED_MARKET_PRICE'].apply(
-        lambda x: 0.15 if x <= price_threshold_low else 0.0
-    )
+    def type_weight(use):
+        s = str(use)
+        if '근린' in s: return 0.4
+        if any(c in s for c in ['다세대', '오피스텔', '연립']): return 0.1
+        return 0.0
 
-    # Logic 4: 위험 지역 가중치 (Regional Risk Weight)
-    # 근거: 수원, 미추홀, 강서, 관악, 대전 등 특정 지역에 대규모 피해 집중
-    # 위험 지역 키워드 (보고서 기반)
-    high_risk_regions = ['미추홀', '강서', '관악', '수원', '대전', '대구']
+    def trust_weight(owner):
+        return 0.5 if owner and ('신탁' in str(owner)) else 0.0
 
-    # Logic 5: 신탁 등기 위험
-    # 근거: 신탁회사가 소유주일 경우, 일반 계약은 무효일 확률 높음
-    df_final['is_trust_owner'] = df_merged['owner_name'].apply(
-        lambda x: 1 if x and ('신탁' in str(x) or '자산관리' in str(x)) else 0
-    )
-    # 신탁이면 대출 비율을 확 높여서 위험군으로 분류되게 함 (+30%)
-    trust_weight = df_final['is_trust_owner'] * 0.3
-
-    # Logic 6: 단기 소유 위험
-    # 근거: 계약일 기준 2년 이내에 주인이 바뀌었다면 갭투자/바지사장 의심
-    def calc_ownership_duration(row):
+    def calc_short_term_weight(row):
         try:
-            # 계약일 - 소유권변동일
-            contract = row['CONTRACT_DATE']
-            changed = row['ownership_changed_date']
-            if pd.isna(contract) or pd.isna(changed): return 9999  # 알 수 없음
+            if pd.isna(row['ownership_changed_date']): return 0.0
+            # use_apr_day나 contract_date 등 기준 날짜 설정 필요 (여기선 현재 시점 혹은 계약일 기준)
+            # 학습 데이터엔 'CONTRACT_DATE'가 있으므로 사용
+            contract_date = row.get('CONTRACT_DATE', datetime.now())
 
-            days = (contract - changed).days
-            return days
+            days = (contract_date - row['ownership_changed_date']).days
+
+            if days < 90: return 0.3
+            if days < 730: return 0.1
+            return 0.0
         except:
-            return 9999
-
-    df_merged['CONTRACT_DATE'] = pd.to_datetime(df_merged['CONTRACT_DATE'], errors='coerce')
-    df_building['ownership_changed_date'] = pd.to_datetime(df_building['ownership_changed_date'], errors='coerce')
-
-    df_final['ownership_days'] = df_merged.apply(calc_ownership_duration, axis=1)
-
-    # 가중치 로직 (계약일 - 소유권 변동일)
-    # 값이 음수인 경우: 세입자가 계약을 하고 입주한 뒤에 집주인이 바뀌었다는 의미
-    # 값이 양수인 경우: 집 주인이 먼저 집을 샀고, 그 이후에 세입자와 전세 계약을 맺은 상태
-    def calculate_short_term_weight(days):
-        # 데이터 없음 (안전 간주)
-        if days == 9999:
             return 0.0
 
-        # 1. 동시진행 의심 구간 (계약일 전후 3개월)
-        # 예: 계약일(1월 1일) ~ 변동일(4월 1일) 사이 -> -90 < days < 90
-        if -90 < days < 90:
-            return 0.3  # [최고 위험] 동시진행 강력 의심
+    w_type = df_final['main_use'].apply(type_weight)
+    w_trust = df_final['owner_name'].apply(trust_weight)
 
-        # 2. 계약 후 주인이 바뀐 경우 (음수)
-        # 이미 살고 있는데 주인이 바뀜 -> 갭투자 매물일 가능성 높음
-        elif days <= -90:
-            return 0.15  # [위험] 갭투자 승계 (새 집주인 리스크)
+    df_final['is_trust_owner'] = df_final['owner_name'].apply(lambda x: 1 if '신탁' in str(x) else 0)
+    df_final['short_term_weight'] = df_final.apply(calc_short_term_weight, axis=1)
 
-        # 3. 계약 전 단기 매수 (양수 2년 미만)
-        # 집을 산 지 얼마 안 돼서 전세 놓음 -> 갭투자 의심
-        elif 0 <= days < 730:
-            return 0.15  # [주의] 단기 보유
+    # 랜덤값은 제거하거나, 노이즈 추가용으로만 미세하게 사용
+    # 여기서는 AI 학습용이므로 랜덤값은 제거하고 정직한 스코어만 남깁니다.
+    df_final['risk_factor_score'] = (w_type + w_trust).clip(0, 1.0)
 
-        # 4. 장기 보유 (안전)
-        else:
-            return 0.0
+    # [중요] 기존 코드와의 호환성을 위해 'estimated_loan_ratio'라는 컬럼명은 유지하되,
+    # 그 의미를 '위험 점수'로 변경합니다.
+    df_final['estimated_loan_ratio'] = df_final['risk_factor_score']
 
-    short_term_weight = df_final['ownership_days'].apply(calculate_short_term_weight)
+    # 4-5. [수정됨] 깡통전세 위험도 (Label/Target 관련)
+    # 실제 빚(Real Debt)이 없으므로 전세가율과 동일하게 설정합니다.
+    # AI는 "risk_factor_score가 높고 & jeonse_ratio가 높을 때" 위험하다는 패턴을 스스로 찾게 됩니다.
+    df_final['total_risk_ratio'] = df_final['RENT_PRICE'] / df_final['ESTIMATED_MARKET_PRICE']
 
-    df_final['short_term_weight'] = short_term_weight
+    # 4-6. 기타 파생변수
+    def simplify_use(x):
+        s = str(x)
+        if '아파트' in s: return 'APT'
+        if '오피스텔' in s: return 'OFFICETEL'
+        if '다세대' in s or '연립' in s: return 'VILLA'
+        return 'ETC'
 
-    # 시군구 + 법정동 문자열 결합
-    full_address = df_merged['시군구'].fillna('') + ' ' + df_merged['법정동'].fillna('')
+    df_final['simple_type'] = df_final['main_use'].apply(simplify_use)
+    df_final['is_illegal'] = df_final['is_violating_building'].apply(lambda x: 1 if str(x).strip() == 'Y' else 0)
 
-    region_weight = full_address.apply(
-        lambda x: 0.15 if any(region in str(x) for region in high_risk_regions) else 0.0
-    )
+    # building_age 등 나머지 로직 유지
+    df_final['use_apr_day'] = pd.to_datetime(df_final['use_apr_day'], errors='coerce')
+    df_final['building_age'] = (datetime.now() - df_final['use_apr_day']).dt.days / 365.25
+    df_final['building_age'] = df_final['building_age'].fillna(0)
 
-    # --------------------------------------------------------------------------
-    # 최종 대출 비율 산정 및 적용
-    # --------------------------------------------------------------------------
-    df_final['estimated_loan_ratio'] = (
-            base_loan_ratio + type_weight + price_weight + region_weight + trust_weight + short_term_weight
-    ).clip(0, 0.9)  # 최대 90% 제한
+    # 5. 최종 컬럼 정리
+    final_cols = [
+        'RENT_PRICE', 'ESTIMATED_MARKET_PRICE', 'PUBLIC_PRICE',
+        'jeonse_ratio', 'hug_risk_ratio',
+        'total_risk_ratio',  # 순수 (전세+실제빚)/시세
+        'estimated_loan_ratio',  # (=risk_factor_score) 정성적 위험 점수
+        'building_age', 'is_illegal', 'simple_type', 'main_use',
+        'is_trust_owner', 'short_term_weight'
+    ]
 
-    # (5) 깡통전세 위험도 ( (대출 + 전세) / 추정시세 )
-    loan_amount = df_merged['ESTIMATED_MARKET_PRICE'] * df_final['estimated_loan_ratio']
-    df_final['total_risk_ratio'] = (loan_amount + df_merged['RENT_PRICE']) / df_merged['ESTIMATED_MARKET_PRICE']
-    df_final['total_risk_ratio'] = df_final['total_risk_ratio'].clip(0, 2.0)
-
-    # 이상치 처리
-    df_final['total_risk_ratio'] = df_final['total_risk_ratio'].replace([np.inf, -np.inf], 0).fillna(0).clip(0, 2.0)
-
-    print(f"--- 데이터 가공 완료: {len(df_final)}건 생성 ---")
-    return df_final
+    df_result = df_final[final_cols].copy()
+    print(f"--- 데이터 가공 완료: {len(df_result)}건 생성 ---")
+    return df_result
 
 if __name__ == "__main__":
-    load_and_engineer_features()
+    # 테스트 실행
+    df = load_and_engineer_features()
+    print(df.head())
+    print("\n[Risk Level 분포]")
+    print(df['total_risk_ratio'].describe())
