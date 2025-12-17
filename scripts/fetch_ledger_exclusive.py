@@ -24,10 +24,10 @@ DB_PATH = os.path.abspath(os.path.join(BASE_DIR, '..', 'local_fraud_db.sqlite'))
 # 1. 설정 (Configuration) - 다중 계정 지원
 # ==========================================
 # 계정 목록 (환경변수에 _1, _2 접미사 붙은 키 필요)
-CLIENT_ID = os.getenv("CLIENT_ID_2")
-CLIENT_SECRET = os.getenv("CLIENT_SECRET_2")
-CODEF_USER_ID = os.getenv("CODEF_USER_ID_2")
-CODEF_USER_RSA_PASSWORD = os.getenv("CODEF_USER_RSA_PASSWORD_2")
+CLIENT_ID = os.getenv("CLIENT_ID_1")
+CLIENT_SECRET = os.getenv("CLIENT_SECRET_1")
+CODEF_USER_ID = os.getenv("CODEF_USER_ID_1")
+CODEF_USER_RSA_PASSWORD = os.getenv("CODEF_USER_RSA_PASSWORD_1")
 
 # API 엔드포인트
 TOKEN_URL = "https://oauth.codef.io/oauth/token"
@@ -491,20 +491,29 @@ def save_job_log(address, status="DETAIL_SAVED"):
     finally:
         conn.close()
 
-def _collect_exclusive_by_road_address(token, address):
+def _collect_exclusive_with_retry(token, address):
     """
-    도로명으로 중간 호/층 조회
+    중간 호/층 조회
     """
-    print(f"      [Work] 도로명으로 전유부(Exclusive) 수집을 시작합니다.")
-
+    print(f"      [Work] 전유부(Exclusive) 수집을 시작합니다.")
     # 1차 시도: 입력받은 지번 주소로 시도
-    _, road_part, build_part = get_all_address_and_building_from_kakao(address)
-    retry_address = f"{road_part} {build_part}".strip()
-
-    if fetch_target_middle_unit(token, retry_address, address):
+    jibun_part, road_part, build_part = get_all_address_and_building_from_kakao(address)
+    address = f"{jibun_part} {build_part}".strip()
+    if fetch_target_middle_unit(token, address):
+        print(f"      [Success] 지번 전유부(Exclusive) 수집 성공 {address}")
         return True
 
-    print(f"      [Fail] 도로명으로 전유부(Exclusive) 수집에 실패했습니다.")
+    try:
+        print(f"      [Fail] 지번 전유부(Exclusive) 수집 실패")
+        print(f"      [Work] 도로명으로 전유부(Exclusive) 수집을 재시도합니다.")
+        retry_address = f"{road_part} {build_part}".strip()
+
+        if fetch_target_middle_unit(token, retry_address):
+            print(f"      [Success] 도로명 전유부(Exclusive) 수집 성공 {retry_address}")
+            return True
+    except Exception as e:
+        print(f"      [Error] 전유부 재시도 주소 생성 실패: {e}")
+
     return False
 
 # 각 지역 시군구별 아파트/오피스텔/연립다세대 1건씩 조회 (총 9건)
@@ -599,7 +608,7 @@ def get_targets_from_rent_db(token, search_sgg):
         for target_addr in target_addrs:
             if token:
                 # 중간 동, 중간 호만을 처리
-                _collect_exclusive_by_road_address(token, target_addr)
+                _collect_exclusive_with_retry(token, target_addr)
             else:
                 print("토큰이 없습니다.")
                 return False
