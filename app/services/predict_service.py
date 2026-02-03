@@ -15,7 +15,7 @@
 import logging
 from datetime import datetime
 from typing import Dict, Any, Optional, Tuple
-
+from app.core.exceptions import DatabaseConnectionError
 from app.services.address_service import (
     normalize_address,
     convert_address_to_pnu,
@@ -142,7 +142,8 @@ def predict_risk(address: str, deposit_manwon: int) -> Dict[str, Any]:
                 "is_short_term": bool(features.get('short_term_weight', 0) > 0)
             }
         }
-
+    except DatabaseConnectionError:
+        raise  # DB 연결 오류는 상위로 전파
     except Exception as e:
         logger.exception(f"예측 오류: {e}")
         return {"error": f"분석 중 오류 발생: {str(e)}"}
@@ -274,7 +275,8 @@ def predict_risk_with_ocr(
                                   if k not in ['estimated_loan_ratio', 'parking_per_household']}
             }
         }
-
+    except DatabaseConnectionError:
+        raise  # DB 연결 오류는 상위로 전파
     except Exception as e:
         logger.exception(f"예측 오류: {e}")
         return _error_response(500, "서버 오류가 발생했습니다", f"분석 중 오류 발생: {str(e)}")

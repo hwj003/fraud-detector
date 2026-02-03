@@ -1,5 +1,5 @@
-from registry_parser import extract_real_estate_data  # 등기부등본
-from ledger_parser import extract_building_ledger # 건축물대장
+from app.services.ocr.registry_parser import extract_real_estate_data  # 등기부등본
+from app.services.ocr.ledger_parser import extract_building_ledger # 건축물대장
 
 def parse_document(file_path, doc_type="unknown"):
     """

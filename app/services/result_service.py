@@ -10,7 +10,7 @@ from typing import Dict, Any
 
 from sqlalchemy import text
 
-from app.core.config import get_engine
+from app.core.database import get_engine
 from app.services.address_service import create_address_key
 
 logger = logging.getLogger(__name__)

@@ -2,11 +2,10 @@ import pandas as pd
 import numpy as np
 import os
 import sys
-import re
 import joblib
 from datetime import datetime
 from sqlalchemy import text
-from scripts.feature_engineering import calculate_risk_features, convert_to_model_input
+from app.services.feature_service import calculate_risk_features, convert_to_model_input
 # ---------------------------------------------------------
 # 1. 프로젝트 설정 로드
 # ---------------------------------------------------------
@@ -14,7 +13,8 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.abspath(os.path.join(current_dir, '..'))
 sys.path.append(project_root)
 
-from app.core.config import engine
+from app.core import get_engine
+engine = get_engine()
 
 
 # ---------------------------------------------------------

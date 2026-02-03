@@ -9,13 +9,13 @@
 """
 import logging
 from datetime import datetime, timedelta
-from typing import Tuple, Optional, Dict, Any
+from typing import Tuple, Optional
 
 from sqlalchemy import text
-from sqlalchemy.exc import OperationalError, SQLAlchemyError
+from sqlalchemy.exc import OperationalError
 
-from app.core.config import get_engine, get_db_session, is_db_available, check_db_connection
-from app.core.exceptions import DatabaseConnectionError, ServiceUnavailableError
+from app.core import get_engine, is_db_available
+from app.core.exceptions import DatabaseConnectionError
 from app.services.address_service import parse_pnu, pnu_to_raw_format
 
 logger = logging.getLogger(__name__)
@@ -151,7 +151,7 @@ def fetch_real_price_from_api(sigungu_code: str, bjdong_code: str) -> bool:
             fetch_trade_data_and_save,
             get_bjdong_code_map
         )
-        from scripts.fetch_data.fetch_rent_data import fetch_rent_data_and_save
+        from scripts.data_collecting.fetch_rent_data import fetch_rent_data_and_save
     except ImportError as e:
         logger.error(f"API 모듈 import 실패: {e}")
         return False

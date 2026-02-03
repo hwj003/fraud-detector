@@ -2,10 +2,8 @@
 
 import pandas as pd
 import numpy as np  # inf 처리를 위해 numpy 임포트
-import re
 import os
 import sys
-from datetime import datetime
 
 # --- [필수] 프로젝트 루트 경로 추가 ---
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -13,7 +11,7 @@ sys.path.append(project_root)
 
 # --- 중앙 설정 파일(engine) 임포트 ---
 from app.core.config import engine
-from scripts.feature_engineering import calculate_risk_features
+from app.services.feature_service import calculate_risk_features
 
 # 4-1. 시세 추정 (기존 로직 유지하거나 함수화 가능, 여기선 DataFrame 연산 효율을 위해 유지)
 def _estimate_market_price_row(row):

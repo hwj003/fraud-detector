@@ -11,7 +11,7 @@ from typing import Tuple, Optional, Dict, Any
 
 from sqlalchemy import text
 
-from app.core.config import get_engine, get_db_session
+from app.core.database import get_engine
 from app.services.address_service import normalize_address
 
 logger = logging.getLogger(__name__)

@@ -5,11 +5,11 @@ import shutil
 import os
 from datetime import datetime
 from fastapi.middleware.cors import CORSMiddleware
-from scripts.ocr.ledger_parser import extract_building_ledger
-from scripts.ocr.registry_parser import extract_real_estate_data
+from app.services.ocr.ledger_parser import extract_building_ledger
+from app.services.ocr.registry_parser import extract_real_estate_data
 from app.services.predict_service import predict_risk_with_ocr  # 새로 만들 함수
 from app.router import stats
-from app.core.config import (
+from app.core import (
     get_settings,
     check_db_connection,
     is_db_available,
@@ -17,9 +17,7 @@ from app.core.config import (
 )
 from app.core.exceptions import DatabaseConnectionError, ServiceUnavailableError
 from app.services.document_validator import (
-    DocumentValidator,
-    validate_document_match,
-    create_mismatch_error_response
+    validate_document_match
 )
 
 app = FastAPI()
