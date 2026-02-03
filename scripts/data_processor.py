@@ -10,7 +10,7 @@ project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.append(project_root)
 
 # --- 중앙 설정 파일(engine) 임포트 ---
-from app.core.config import engine
+from app.core.database import engine
 from app.services.feature_service import calculate_risk_features
 
 # 4-1. 시세 추정 (기존 로직 유지하거나 함수화 가능, 여기선 DataFrame 연산 효율을 위해 유지)

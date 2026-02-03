@@ -6,7 +6,7 @@ from sqlalchemy import text
 
 # 프로젝트 루트 경로 설정 (db_manager 찾기 위해)
 sys.path.append(os.path.dirname(os.path.abspath(os.path.dirname(__file__))))
-from scripts.db_manager import engine
+from app.core.database import engine
 
 # 좌표 캐시 파일 위치 (본인 프로젝트 구조에 맞게 수정 확인)
 JSON_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'region_coords_cache.json')

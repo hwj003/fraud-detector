@@ -7,7 +7,7 @@ from db_manager import get_connection
 # 중앙 설정 파일(engine) 임포트
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.append(project_root)
-from app.core.config import engine
+from app.core.database import engine
 
 # 특정 시군구 코드 수집을 위한 배열
 TARGET_SGG_CODES = []

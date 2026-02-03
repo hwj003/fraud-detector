@@ -6,7 +6,7 @@ Map Service - 건물유형별 전세가율 통계 조회
 """
 import os
 from sqlalchemy import text
-from app.core.config import engine
+from app.core.database import engine
 
 # 좌표 캐시 파일 경로
 COORD_CACHE_FILE = os.path.join(os.getcwd(), 'data', 'region_coords_cache.json')

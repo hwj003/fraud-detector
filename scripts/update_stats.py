@@ -3,7 +3,7 @@ import os
 import pandas as pd
 from sqlalchemy import text
 
-from scripts.db_manager import engine
+from app.core.database import engine
 
 
 def categorize_building_type(raw_type):

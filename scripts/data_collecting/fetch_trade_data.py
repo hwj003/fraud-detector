@@ -9,7 +9,7 @@ from functools import lru_cache
 # --- 프로젝트 경로 및 엔진 ---
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.append(project_root)
-from app.core.config import engine, load_dotenv
+from app.core.database import engine, load_dotenv
 
 # --- 환경 변수 및 상수 ---
 load_dotenv()

@@ -8,11 +8,9 @@
 - 위험 요인 분석
 """
 import os
-import re
 import logging
 from datetime import datetime
-from typing import Dict, List, Any, Optional, Tuple
-from functools import lru_cache
+from typing import Dict, List, Any, Optional
 
 import numpy as np
 import pandas as pd

@@ -9,7 +9,7 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.abspath(os.path.join(current_dir, '..'))
 sys.path.append(project_root)
 
-from app.core.config import engine
+from app.core.database import engine
 from scripts.risk_pipeline import _create_join_key_robust, _generate_key_from_pnu
 
 # 출력 옵션 설정 (데이터 다 보이게)

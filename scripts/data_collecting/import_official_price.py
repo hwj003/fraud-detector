@@ -4,7 +4,7 @@ import sys
 
 # 프로젝트 설정 (db_manager 위치에 맞게 수정)
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from db_manager import engine # engine 가져오기
+from app.core.database import engine # engine 가져오기
 
 
 def import_csv_to_db(csv_path):
