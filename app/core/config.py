@@ -6,11 +6,11 @@ class Settings(BaseSettings):
     APP_ENV: str = "local"
 
     # MySQL 설정
-    DB_USER: str = "root"
-    DB_PASSWORD: str = "2345"
-    DB_HOST: str = "localhost"
-    DB_PORT: str = "3306"
-    DB_NAME: str = "fraud_db"
+    DB_USER: str
+    DB_PASSWORD: str
+    DB_HOST: str
+    DB_PORT: str
+    DB_NAME: str
 
     # 연결 타임아웃 설정 (초)
     DB_CONNECT_TIMEOUT: int = 5
