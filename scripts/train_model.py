@@ -10,7 +10,7 @@ import joblib
 from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, classification_report, roc_auc_score
-
+from scripts.feature_engineering import TRAIN_FEATURES
 # ---------------------------------------------------------
 # 1. 프로젝트 경로 및 폰트 설정
 # ---------------------------------------------------------
@@ -84,7 +84,10 @@ def train_and_save_model():
     # 조건 4: 위반건축물
     cond_illegal = df['is_illegal'] == 1
 
-    df['is_fraud'] = (cond_trust_risk | cond_short_term |cond_hug | cond_debt | cond_complex | cond_illegal).astype(int)
+    # 조건 5: 무자본 갭투자 의심 (매매가와 전세가 차이가 너무 적음)
+    gap_investment_risk = (df['ESTIMATED_MARKET_PRICE'] - df['RENT_PRICE']) < 1000  # 1,000만원 미만 갭
+
+    df['is_fraud'] = (cond_trust_risk | cond_short_term |cond_hug | cond_debt | cond_complex | cond_illegal | gap_investment_risk).astype(int)
 
     total_cnt = len(df)
     fraud_cnt = df['is_fraud'].sum()
@@ -101,29 +104,21 @@ def train_and_save_model():
     # ---------------------------------------------------------
     # 5. 학습용 데이터셋 분리
     # ---------------------------------------------------------
-    # 학습에 사용할 피처 정의
-    # 주의: total_risk_ratio(전세가율) 자체가 정답을 만드는 핵심 변수이지만,
-    # AI가 '어느 정도 비율일 때 위험한지' 경계선을 배우게 하기 위해 포함합니다.
-    feature_candidates = [
-        'jeonse_ratio',  # 전세가율
-        'hug_risk_ratio',  # HUG 가입여부 지표
-        'total_risk_ratio',  # 깡통전세율
-        'estimated_loan_ratio',  # 정성적 위험 점수 (집주인/건물특성)
-        'building_age',  # 건물 연식
-        'is_illegal',  # 위반 여부
-        'parking_per_household',  # 주차 (있다면)
-        'is_micro_complex',  # 나홀로 아파트 여부 (있다면)
-        'is_trust_owner',  #
-        'short_term_weight'  #
-    ]
+    print(f"\n>> 피처 엔지니어링 모듈의 기준을 따릅니다.")
 
-    # 생성된 원-핫 인코딩 컬럼들 추가 (type_APT, type_VILLA ...)
-    feature_candidates.extend([c for c in df.columns if c.startswith('type_')])
+    # [핵심 수정] 하드코딩된 리스트 대신, 공통 변수 사용!
+    # 이렇게 해야 predict.py와 train_model.py가 서로 다른 컬럼을 바라보는 사고를 막습니다.
+    target_features = TRAIN_FEATURES
 
-    # 실제 데이터프레임에 존재하는 컬럼만 최종 선택
-    feature_cols = [f for f in feature_candidates if f in df.columns]
+    # 실제 데이터프레임에 존재하는 컬럼만 최종 선택 (방어 코드)
+    feature_cols = [f for f in target_features if f in df.columns]
 
-    print(f"   사용된 피처({len(feature_cols)}개): {feature_cols}")
+    # 만약 feature_cols 개수가 TRAIN_FEATURES보다 적으면 경고
+    if len(feature_cols) != len(TRAIN_FEATURES):
+        missing = set(TRAIN_FEATURES) - set(feature_cols)
+        print(f"⚠️ [주의] 일부 피처가 누락되었습니다: {missing}")
+
+    print(f"   최종 사용 피처({len(feature_cols)}개): {feature_cols}")
 
     X = df[feature_cols]
     y = df['is_fraud']

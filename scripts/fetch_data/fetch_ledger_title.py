@@ -1,4 +1,4 @@
-import os, time, sys, re
+import os, re
 from dotenv import load_dotenv
 import requests
 import json
@@ -6,9 +6,9 @@ import sqlite3
 import urllib.parse
 # [수정] 경로 문제 해결을 위한 조건부 임포트
 try:
-    # 1. 외부(predict.py 등)에서 패키지로 불러올 때 (프로젝트 루트 기준)
+    # 1. 외부(predict_service.py 등)에서 패키지로 불러올 때 (프로젝트 루트 기준)
     from scripts.db_manager import init_db, get_connection
-    from scripts.kakao_localmap_api import get_building_name_from_kakao, get_road_address_from_kakao
+    from app.utils.kakao_localmap_api import get_building_name_from_kakao, get_road_address_from_kakao
 except ModuleNotFoundError:
     # 2. 이 파일을 직접 실행할 때 (현재 폴더 기준)
     from db_manager import init_db, get_connection
@@ -21,10 +21,10 @@ DB_PATH = os.path.abspath(os.path.join(BASE_DIR, '..', 'local_fraud_db.sqlite'))
 # ==========================================
 # 1. 설정 (Configuration)
 # ==========================================
-CLIENT_ID = os.getenv("CLIENT_ID_1")
-CLIENT_SECRET = os.getenv("CLIENT_SECRET_1")
-CODEF_USER_ID = os.getenv("CODEF_USER_ID_1")
-CODEF_USER_RSA_PASSWORD = os.getenv("CODEF_USER_RSA_PASSWORD_1")
+CLIENT_ID = os.getenv("CLIENT_ID_2")
+CLIENT_SECRET = os.getenv("CLIENT_SECRET_2")
+CODEF_USER_ID = os.getenv("CODEF_USER_ID_2")
+CODEF_USER_RSA_PASSWORD = os.getenv("CODEF_USER_RSA_PASSWORD_2")
 
 # API 엔드포인트
 TOKEN_URL = "https://oauth.codef.io/oauth/token"
@@ -493,8 +493,8 @@ project_root = os.path.abspath(os.path.join(current_dir, '..'))
 sys.path.append(project_root)
 
 from app.core.config import engine
-from scripts.fetch_ledger_title import collect_title_data  # 표제부 수집 함수 임포트
-from scripts.fetch_ledger_exclusive import get_access_token  # 토큰 발급 함수
+from scripts.fetch_data.fetch_ledger_title import collect_title_data  # 표제부 수집 함수 임포트
+from scripts.fetch_data.fetch_ledger_exclusive import get_access_token  # 토큰 발급 함수
 
 
 def fetch_missing_titles():
@@ -515,7 +515,6 @@ def fetch_missing_titles():
         WHERE t.unique_number IS NULL       -- 표제부에 없는 경우
           AND b.unique_number IS NOT NULL   
           AND LENGTH(b.unique_number) >= 19 -- 유효한 PNU 길이 확인
-          AND SUBSTR(b.unique_number, 1, 5) = '28237'
         GROUP BY SUBSTR(b.unique_number, 1, 19)
     """
 

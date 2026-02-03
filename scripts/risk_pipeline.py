@@ -6,7 +6,7 @@ import re
 import joblib
 from datetime import datetime
 from sqlalchemy import text
-
+from scripts.feature_engineering import calculate_risk_features, convert_to_model_input
 # ---------------------------------------------------------
 # 1. 프로젝트 설정 로드
 # ---------------------------------------------------------
@@ -224,30 +224,31 @@ def run_risk_analysis_pipeline():
     # 공식: (전세금 + 실제대출) / 시세
     df_target['total_risk_ratio'] = (df_target['rent_price'] + real_debt_amount) / df_target['est_market_price']
 
-    # (6) [수정됨] 등급 판정 로직
-    def determine_risk_level(row):
-        # 1. 재무적 위험 (Financial) - 즉시 위험
-        if row['hug_risk_ratio'] > 1.0: return 'RISKY'  # 보증보험 불가
-        if row['total_risk_ratio'] >= 0.8: return 'RISKY'  # 깡통전세 (80% 이상)
 
-        # 2. 정성적 위험 (Qualitative) - 주의 필요
-        # 전세가율은 괜찮지만, 집주인/건물이 너무 수상할 때
-        if row['total_risk_ratio'] >= 0.6:
-            # 60~80% 구간인데 위험 요소가 하나라도 있으면 주의
-            if row['risk_simulation_score'] >= 0.3: return 'CAUTION'
-            return 'SAFE'  # 깨끗하면 SAFE
-
-        # 전세가율이 아주 낮아도(60% 미만), 위험 점수가 매우 높으면(0.5 이상) 주의
-        if row['risk_simulation_score'] >= 0.5: return 'CAUTION'
-
-        return 'SAFE'
-
-    df_target['risk_level'] = df_target.apply(determine_risk_level, axis=1)
 
     # 점수는 표시용으로 변환 (재무 위험 + 정성 위험 반영)
     df_target['risk_score'] = (
                 (df_target['total_risk_ratio'] * 0.7 + df_target['risk_simulation_score'] * 0.3) * 100).astype(
         int).clip(0, 100)
+
+    # (6) [수정됨] 등급 판정 로직
+
+    def determine_risk_level(row):
+        # 1. 재무적 위험 (Financial) - 즉시 위험
+        if row['hug_risk_ratio'] > 1.0: return 'RISKY'  # 보증보험 불가
+        if row['total_risk_ratio'] >= 0.8: return 'RISKY'  # 깡통전세 (80% 이상)
+
+        if row['risk_score'] >= 80:
+            return 'RISKY'
+
+        if row['risk_score'] >= 60:
+            return 'CAUTION'
+
+        if row['risk_simulation_score'] >= 0.5: return 'CAUTION'
+
+        return 'SAFE'
+
+    df_target['risk_level'] = df_target.apply(determine_risk_level, axis=1)
 
     # DB 저장을 위해 loan_amount 컬럼은 0 또는 시뮬레이션 값으로 채워둠 (호환성 유지)
     # 단, total_risk_ratio 계산에는 이미 빠져있음.
@@ -261,79 +262,47 @@ def run_risk_analysis_pipeline():
         try:
             rf_model = joblib.load(model_path)
 
-            # [중요] 모델 학습 때 사용한 피처 이름 확인
-            train_features = rf_model.feature_names_in_
+            # DataFrame의 각 행을 순회하며 입력 데이터 생성
+            # (속도를 위해 벡터화 연산을 권장하지만, 로직 일관성을 위해 apply 사용)
 
-            # 1) AI 입력용 데이터프레임 준비
-            df_ai = df_target.copy()
+            def get_ai_prob(row):
+                # 1. 필요한 변수 준비 (data_processor와 동일 로직)
+                short_term_w = 0.0
+                if pd.notna(row['ownership_changed_date']) and pd.notna(row['contract_date']):
+                    days = (row['contract_date'] - row['ownership_changed_date']).days
+                    if days < 90:
+                        short_term_w = 0.3
+                    elif days < 730:
+                        short_term_w = 0.1
 
-            # 2) 파생 변수 생성 (train_model.py / data_processor.py 와 동일하게!)
-            # 2-1. 건물 유형 단순화 (type_APT 등)
-            def simplify_use(x):
-                s = str(x)
-                if '아파트' in s: return 'APT'
-                if '오피스텔' in s: return 'OFFICETEL'
-                if '다세대' in s or '연립' in s: return 'VILLA'
-                return 'ETC'
+                is_trust = 1 if row['owner_name'] and '신탁' in str(row['owner_name']) else 0
+                is_viol = 1 if str(row['is_violating_building']).strip() == 'Y' else 0
 
-            df_ai['simple_type'] = df_ai['main_use'].apply(simplify_use)
+                # 2. 피처 계산
+                feats = calculate_risk_features(
+                    deposit_amount=row['rent_price'],
+                    market_price=row['est_market_price'],
+                    real_debt=0,  # 배치 분석 시엔 등기부 빚 정보 없으므로 0
+                    main_use=row['main_use'],
+                    usage_approval_date=row['use_apr_day'],
+                    is_illegal=is_viol,
+                    is_trust_owner=is_trust,
+                    short_term_weight=short_term_w
+                )
 
-            # 2-2. One-Hot Encoding
-            df_ai = pd.get_dummies(df_ai, columns=['simple_type'], prefix='type')
+                # 3. 모델 입력 포맷 변환 (DataFrame 1행)
+                df_input = convert_to_model_input(feats)
 
-            # 2-3. 추가된 핵심 변수들 (이게 없어서 에러가 났을 확률 99%)
-            # 이미 위에서 w_trust, w_short 등을 계산했으므로 재활용하거나 새로 생성
-            # (risk_pipeline 위쪽 로직에서 w_trust, w_short 변수가 있다면 활용)
+                # 4. 예측
+                return rf_model.predict_proba(df_input)[0][1]
 
-            # [재계산 로직 - 안전하게 다시 명시]
-            df_ai['is_trust_owner'] = df_ai['owner_name'].apply(lambda x: 1 if '신탁' in str(x) else 0)
-
-            # 단기 소유 가중치 (위쪽 w_short 로직과 동일)
-            def calc_short_term(row):
-                try:
-                    if pd.isna(row['contract_date']) or pd.isna(row['ownership_changed_date']): return 0.0
-                    d = (row['contract_date'] - row['ownership_changed_date']).days
-                    if d < 90: return 0.3
-                    if d < 730: return 0.1
-                    return 0.0
-                except:
-                    return 0.0
-
-            df_ai['short_term_weight'] = df_ai.apply(calc_short_term, axis=1)
-
-            # 2-4. 기타 변수 (학습 때 썼던 것들)
-            df_ai['is_illegal'] = df_ai['is_violating_building'].apply(lambda x: 1 if str(x).strip() == 'Y' else 0)
-
-            df_ai['use_apr_day'] = pd.to_datetime(df_ai['use_apr_day'], errors='coerce')
-            df_ai['building_age'] = (datetime.now() - df_ai['use_apr_day']).dt.days / 365.25
-            df_ai['building_age'] = df_ai['building_age'].fillna(0)
-
-            # 주차/나홀로아파트 정보가 risk_pipeline SQL에는 없을 수 있음.
-            # 만약 SQL에서 안 가져왔다면 0으로 채워야 함 (학습 피처엔 있는데 데이터엔 없는 경우)
-            if 'parking_per_household' not in df_ai.columns: df_ai['parking_per_household'] = 0
-            if 'is_micro_complex' not in df_ai.columns: df_ai['is_micro_complex'] = 0
-
-            # 3) 컬럼 순서 및 누락 처리 (모델 기준)
-            for col in train_features:
-                if col not in df_ai.columns:
-                    df_ai[col] = 0  # 없는 컬럼은 0으로 채움
-
-            # 모델이 아는 순서대로 정렬
-            X_input = df_ai[train_features]
-
-            # 4) 예측
-            df_target['ai_risk_prob'] = rf_model.predict_proba(X_input)[:, 1]
+            # 전체 데이터에 적용
+            df_target['ai_risk_prob'] = df_target.apply(get_ai_prob, axis=1)
             print(f"-> AI 예측 완료 (평균 위험도: {df_target['ai_risk_prob'].mean():.4f})")
 
         except Exception as e:
-            # [디버깅] 여기서 에러 내용을 꼭 확인하세요!
-            print(f"!!! [Critical] AI 모델 예측 실패 원인: {e}")
-            import traceback
-            traceback.print_exc()  # 상세 에러 로그 출력
+            print(f"!!! [Critical] AI 모델 예측 실패: {e}")
             df_target['ai_risk_prob'] = 0.0
-    else:
-        print("!!! 모델 파일이 존재하지 않습니다.")
-        df_target['ai_risk_prob'] = 0.0
 
     # --- DB 저장 ---
     df_save = df_target[[

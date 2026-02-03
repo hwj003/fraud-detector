@@ -20,3 +20,9 @@ notebook
 models
 assets
 *.csv
+ocr_test
+ocr_debug
+query
+db
+docker-compose.yml
+mysql_data

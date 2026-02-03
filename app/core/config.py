@@ -1,49 +1,217 @@
 import os
+from functools import lru_cache
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Engine
+from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
+from contextlib import contextmanager
+from pydantic_settings import BaseSettings
+from app.core.exceptions import DatabaseConnectionError
 from dotenv import load_dotenv
-from sqlalchemy import create_engine
 
-# [1] .env 파일 로드
-# (프로젝트 루트 폴더에서 .env 파일을 찾음)
-dotenv_path = os.path.join(os.path.dirname(__file__), '..', '..', '.env')
-load_dotenv(dotenv_path=dotenv_path)
+class Settings(BaseSettings):
+    """환경 설정 - .env 파일에서 로드"""
+    APP_ENV: str = "local"
 
-# [2] 현재 환경 읽기 (기본값: 'local')
-APP_ENV = os.getenv("APP_ENV", "local")
+    # MySQL 설정
+    DB_USER: str = "root"
+    DB_PASSWORD: str = ""
+    DB_HOST: str = "localhost"
+    DB_PORT: str = "3306"
+    DB_NAME: str = "fraud_db"
 
-# [3] DB_URL 및 SQLAlchemy 엔진 설정
-DB_URL = ""
-engine = None
+    # 연결 타임아웃 설정 (초)
+    DB_CONNECT_TIMEOUT: int = 5
+    DB_READ_TIMEOUT: int = 30
 
-print(f"--- [DB Config] 현재 환경: {APP_ENV} ---")
+    class Config:
+        env_file = ".env"
+        extra = "ignore"
 
-if APP_ENV == "prod":
-    # --- 운영 환경 (MySQL) ---
-    DB_USER = os.getenv("DB_USER")
-    DB_PASSWORD = os.getenv("DB_PASSWORD")
-    DB_HOST = os.getenv("DB_HOST")
-    DB_PORT = os.getenv("DB_PORT")
-    DB_NAME = os.getenv("DB_NAME")
 
-    if not all([DB_USER, DB_PASSWORD, DB_HOST, DB_PORT, DB_NAME]):
-        raise ValueError("[prod] DB 접속 정보(USER, PASS, HOST, PORT, NAME)가 없습니다.")
+@lru_cache
+def get_settings() -> Settings:
+    """설정 싱글톤"""
+    return Settings()
 
-    DB_URL = f"mysql+mysqlconnector://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
-    print(f"운영 DB(MySQL)에 연결합니다: {DB_HOST}")
 
-else:
-    # --- 로컬 환경 (SQLite) ---
-    SQLITE_DB_PATH = os.getenv("SQLITE_DB_PATH", "local_dev.sqlite")
+# === Engine 관리 ===
+_engine: Engine | None = None
+_db_available: bool | None = None
 
-    # [중요] SQLite 경로는 프로젝트 루트 기준이어야 함
-    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
-    DB_PATH = os.path.join(project_root, SQLITE_DB_PATH)
+def get_engine() -> Engine:
+    """DB 엔진 싱글톤 (Lazy 초기화)"""
+    global _engine
 
-    DB_URL = f"sqlite:///{DB_PATH}"
-    print(f"로컬 DB(SQLite)에 연결합니다: {DB_PATH}")
+    if _engine is not None:
+        return _engine
 
-# [4] 최종 엔진 생성
-try:
-    engine = create_engine(DB_URL)
-except Exception as e:
-    print(f"DB 엔진 생성 실패: {e}")
-    raise
+    settings = get_settings()
+
+    db_url = (
+        f"mysql+pymysql://{settings.DB_USER}:{settings.DB_PASSWORD}"
+        f"@{settings.DB_HOST}:{settings.DB_PORT}/{settings.DB_NAME}"
+        f"?charset=utf8mb4"
+        f"&connect_timeout={settings.DB_CONNECT_TIMEOUT}"
+        f"&read_timeout={settings.DB_READ_TIMEOUT}"
+    )
+
+    _engine = create_engine(
+        db_url,
+        echo=(settings.APP_ENV == "local"),  # 로컬에서만 SQL 로그
+        pool_recycle=3600,
+        pool_size=10,
+        max_overflow=20,
+        pool_pre_ping = True, # 연결 상태 사전 확인
+        pool_timeout=settings.DB_CONNECT_TIMEOUT, # 풀에서 연결 대기 타임아웃
+    )
+
+    return _engine
+
+
+def check_db_connection() -> bool:
+    """
+    데이터베이스 연결 상태 확인
+
+    Returns:
+        연결 가능 여부
+    """
+    global _db_available
+
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        _db_available = True
+        return True
+    except (OperationalError, SQLAlchemyError) as e:
+        _db_available = False
+        return False
+
+
+def is_db_available() -> bool:
+    """
+    DB 가용성 캐시 확인 (빠른 체크)
+
+    최초 호출 시에만 실제 연결 테스트
+    """
+    global _db_available
+
+    if _db_available is None:
+        return check_db_connection()
+    return _db_available
+
+
+def reset_db_availability():
+    """DB 가용성 캐시 리셋 (재연결 시도용)"""
+    global _db_available
+    _db_available = None
+
+
+def get_connection_with_check():
+    """
+    연결 상태 확인 후 연결 반환
+
+    Raises:
+        DatabaseConnectionError: 연결 실패 시
+    """
+    try:
+        engine = get_engine()
+        conn = engine.connect()
+        return conn
+    except OperationalError as e:
+        reset_db_availability()
+        raise DatabaseConnectionError(
+            "MySQL 서버에 연결할 수 없습니다",
+            original_error=e
+        )
+
+# === Session 관리 ===
+_SessionLocal = None
+
+
+def get_session_factory():
+    """세션 팩토리 싱글톤"""
+    global _SessionLocal
+
+    if _SessionLocal is None:
+        _SessionLocal = sessionmaker(
+            autocommit=False,
+            autoflush=False,
+            bind=get_engine()
+        )
+
+    return _SessionLocal
+
+
+@contextmanager
+def get_db_session():
+    """
+    컨텍스트 매니저로 세션 관리
+
+    Raises:
+        DatabaseConnectionError: 연결 실패 시
+
+    사용법:
+        with get_db_session() as session:
+            session.execute(...)
+    """
+    # 연결 가능 여부 먼저 확인
+    if not is_db_available():
+        if not check_db_connection():  # 재확인
+            raise DatabaseConnectionError("데이터베이스에 연결할 수 없습니다")
+
+    SessionLocal = get_session_factory()
+    db = SessionLocal()
+    try:
+        yield db
+        db.commit()
+    except OperationalError as e:
+        db.rollback()
+        reset_db_availability()
+        raise DatabaseConnectionError(
+            "데이터베이스 연결이 끊어졌습니다",
+            original_error=e
+        )
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def get_db():
+    """FastAPI Dependency Injection용 제너레이터"""
+    # 연결 가능 여부 먼저 확인
+    if not is_db_available():
+        if not check_db_connection():
+            raise DatabaseConnectionError("데이터베이스에 연결할 수 없습니다")
+
+    SessionLocal = get_session_factory()
+    db = SessionLocal()
+    try:
+        yield db
+        db.commit()
+    except OperationalError as e:
+        db.rollback()
+        reset_db_availability()
+        raise DatabaseConnectionError(
+            "데이터베이스 연결이 끊어졌습니다",
+            original_error=e
+        )
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+# === 하위 호환성 ===
+def __getattr__(name: str):
+    """기존 코드 호환: from app.core.config import engine"""
+    if name == "engine":
+        return get_engine()
+    if name == "load_dotenv":
+        from dotenv import load_dotenv
+        return load_dotenv
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

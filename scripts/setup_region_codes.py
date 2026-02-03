@@ -21,7 +21,7 @@ TABLE_BJDONG = "meta_bjdong_codes" # 2. 법정동 단위 테이블 (건축물대
 
 # 수집 시작 날짜를 '201501'이 아닌, '현재 달의 다음 달'로 설정
 # 예: 2025년 10월 -> '202511'로 설정.
-# 'fetch' 스크립트가 이 값을 보고 '202510'부터 수집을 시작합니다.
+# 'fetch_data' 스크립트가 이 값을 보고 '202510'부터 수집을 시작합니다.
 NOW_MONTH = datetime.now()
 DEFAULT_START_DATE = NOW_MONTH.strftime('%Y%m') # 예: '202511'
 

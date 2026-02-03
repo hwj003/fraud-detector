@@ -13,7 +13,18 @@ sys.path.append(project_root)
 
 # --- 중앙 설정 파일(engine) 임포트 ---
 from app.core.config import engine
+from scripts.feature_engineering import calculate_risk_features
 
+# 4-1. 시세 추정 (기존 로직 유지하거나 함수화 가능, 여기선 DataFrame 연산 효율을 위해 유지)
+def _estimate_market_price_row(row):
+    if pd.notna(row['TRADE_PRICE']) and row['TRADE_PRICE'] > 0:
+        return row['TRADE_PRICE']
+    if pd.notna(row['PUBLIC_PRICE']) and row['PUBLIC_PRICE'] > 0:
+        m_use = str(row['main_use'])
+        if any(x in m_use for x in ['다세대', '오피스텔', '연립', '근린']):
+            return row['PUBLIC_PRICE'] * 1.8
+        return row['PUBLIC_PRICE'] * 1.5
+    return np.nan
 
 # --- 1. 헬퍼 함수 (키 생성) ---
 def _create_join_key_from_columns(row, keys=['시군구', '법정동', '본번', '부번']):
@@ -342,108 +353,88 @@ def load_and_engineer_features() -> pd.DataFrame:
 
     print("--- 4. 파생변수 생성 및 시뮬레이션 (Modified) ---")
 
-    # 4-1. 시세 추정
-    def estimate_market_price(row):
-        if pd.notna(row['TRADE_PRICE']) and row['TRADE_PRICE'] > 0:
-            return row['TRADE_PRICE']
-        if pd.notna(row['PUBLIC_PRICE']) and row['PUBLIC_PRICE'] > 0:
-            m_use = str(row['main_use'])
-            if any(x in m_use for x in ['다세대', '오피스텔', '연립', '근린']):
-                return row['PUBLIC_PRICE'] * 1.8
-            return row['PUBLIC_PRICE'] * 1.5
-        return np.nan
-
-    df_merged['ESTIMATED_MARKET_PRICE'] = df_merged.apply(estimate_market_price, axis=1)
+    df_merged['ESTIMATED_MARKET_PRICE'] = df_merged.apply(_estimate_market_price_row, axis=1)
     df_merged = df_merged.dropna(subset=['ESTIMATED_MARKET_PRICE'])
 
-    # 4-2. 전세가율
-    df_merged['jeonse_ratio'] = df_merged['RENT_PRICE'] / df_merged['ESTIMATED_MARKET_PRICE']
-    valid_mask = df_merged['jeonse_ratio'] < 2.0
-    df_final = df_merged[valid_mask].copy()
+    # 4-2. [핵심 변경] calculate_risk_features 함수를 DataFrame 전체에 적용
+    # DataFrame의 각 행(row)을 넘겨서 딕셔너리를 받은 뒤, 다시 DataFrame으로 변환
 
-    # 4-3. HUG 위험도
-    filled_public = df_final['PUBLIC_PRICE'].fillna(df_final['ESTIMATED_MARKET_PRICE'] * 0.7)
-    hug_limit = filled_public * 1.26
-    df_final['hug_risk_ratio'] = df_final.apply(
-        lambda x: x['RENT_PRICE'] / hug_limit[x.name] if hug_limit[x.name] > 0 else 0, axis=1
-    )
-
-    # 4-4. [수정됨] 위험 요소 점수화 (Feature Engineering)
-    # 이 값들을 더 이상 '대출금'으로 환산해서 빚에 더하지 않습니다.
-    # 대신 AI가 학습할 '특징(Feature)'으로만 남겨둡니다.
-
-    def type_weight(use):
-        s = str(use)
-        if '근린' in s: return 0.4
-        if any(c in s for c in ['다세대', '오피스텔', '연립']): return 0.1
-        return 0.0
-
-    def trust_weight(owner):
-        return 0.5 if owner and ('신탁' in str(owner)) else 0.0
-
-    def calc_short_term_weight(row):
+    def apply_feature_engineering(row):
+        # 1. 단기 소유 가중치 계산 (날짜 차이)
+        short_term_w = 0.0
         try:
-            if pd.isna(row['ownership_changed_date']): return 0.0
-            # use_apr_day나 contract_date 등 기준 날짜 설정 필요 (여기선 현재 시점 혹은 계약일 기준)
-            # 학습 데이터엔 'CONTRACT_DATE'가 있으므로 사용
-            contract_date = row.get('CONTRACT_DATE', datetime.now())
-
-            days = (contract_date - row['ownership_changed_date']).days
-
-            if days < 90: return 0.3
-            if days < 730: return 0.1
-            return 0.0
+            if pd.notna(row['ownership_changed_date']) and pd.notna(row['CONTRACT_DATE']):
+                days = (row['CONTRACT_DATE'] - row['ownership_changed_date']).days
+                if days < 90:
+                    short_term_w = 0.3
+                elif days < 730:
+                    short_term_w = 0.1
         except:
-            return 0.0
+            pass
 
-    w_type = df_final['main_use'].apply(type_weight)
-    w_trust = df_final['owner_name'].apply(trust_weight)
+        # 2. 신탁 여부
+        is_trust = 1 if row['owner_name'] and '신탁' in str(row['owner_name']) else 0
 
-    df_final['is_trust_owner'] = df_final['owner_name'].apply(lambda x: 1 if '신탁' in str(x) else 0)
-    df_final['short_term_weight'] = df_final.apply(calc_short_term_weight, axis=1)
+        # 3. 위반 여부
+        is_viol = 1 if str(row['is_violating_building']).strip() == 'Y' else 0
 
-    # 랜덤값은 제거하거나, 노이즈 추가용으로만 미세하게 사용
-    # 여기서는 AI 학습용이므로 랜덤값은 제거하고 정직한 스코어만 남깁니다.
-    df_final['risk_factor_score'] = (w_type + w_trust).clip(0, 1.0)
+        # 4. 함수 호출
+        feats = calculate_risk_features(
+            deposit_amount=row['RENT_PRICE'],
+            market_price=row['ESTIMATED_MARKET_PRICE'],
+            real_debt=0,  # 학습 데이터엔 등기부 채권 정보가 보통 없음
+            main_use=row['main_use'],
+            usage_approval_date=row['use_apr_day'],  # datetime 객체도 처리되도록 함수 수정 필요할 수 있음
+            is_illegal=is_viol,
+            is_trust_owner=is_trust,
+            short_term_weight=short_term_w,
+            parking_count = row.get('parking_cnt', 0),  # df_title에서 가져온 값
+            household_count = row.get('household_cnt', 0),  # df_title에서 가져온 값
+        )
+        return pd.Series(feats)
 
-    # [중요] 기존 코드와의 호환성을 위해 'estimated_loan_ratio'라는 컬럼명은 유지하되,
-    # 그 의미를 '위험 점수'로 변경합니다.
-    df_final['estimated_loan_ratio'] = df_final['risk_factor_score']
+    # 새로운 피처들을 생성하여 기존 DF에 병합
+    feature_df = df_merged.apply(apply_feature_engineering, axis=1)
+    df_final = pd.concat([df_merged, feature_df], axis=1)
 
-    # 4-5. [수정됨] 깡통전세 위험도 (Label/Target 관련)
-    # 실제 빚(Real Debt)이 없으므로 전세가율과 동일하게 설정합니다.
-    # AI는 "risk_factor_score가 높고 & jeonse_ratio가 높을 때" 위험하다는 패턴을 스스로 찾게 됩니다.
-    df_final['total_risk_ratio'] = df_final['RENT_PRICE'] / df_final['ESTIMATED_MARKET_PRICE']
+    print("--- [Data Augmentation] 가상의 빚(Debt) 데이터 주입 ---")
+    # 1. 안전한 데이터 중 30%를 복제하여 '위험 데이터'로 변조
+    safe_samples = df_final[df_final['total_risk_ratio'] < 0.7].sample(frac=0.3, random_state=42).copy()
 
-    # 4-6. 기타 파생변수
-    def simplify_use(x):
-        s = str(x)
-        if '아파트' in s: return 'APT'
-        if '오피스텔' in s: return 'OFFICETEL'
-        if '다세대' in s or '연립' in s: return 'VILLA'
-        return 'ETC'
+    # 2. 가상의 빚을 시세의 50% ~ 90% 수준으로 랜덤하게 부여
+    import numpy as np
+    safe_samples['random_debt_ratio'] = np.random.uniform(0.5, 0.9, size=len(safe_samples))
 
-    df_final['simple_type'] = df_final['main_use'].apply(simplify_use)
-    df_final['is_illegal'] = df_final['is_violating_building'].apply(lambda x: 1 if str(x).strip() == 'Y' else 0)
+    # 'real_debt' 피처를 역산해서 주입 (total_risk_ratio를 높이기 위해)
+    # 주의: feature_engineering 로직상 total_risk_ratio는 (보증금 + 빚)/시세 임.
+    # 여기서는 피처를 다시 계산해주는 것이 가장 정확함.
 
-    # building_age 등 나머지 로직 유지
-    df_final['use_apr_day'] = pd.to_datetime(df_final['use_apr_day'], errors='coerce')
-    df_final['building_age'] = (datetime.now() - df_final['use_apr_day']).dt.days / 365.25
-    df_final['building_age'] = df_final['building_age'].fillna(0)
+    def inject_fake_debt(row):
+        # 가상의 빚 설정 (시세 * 랜덤비율)
+        fake_debt = row['ESTIMATED_MARKET_PRICE'] * row['random_debt_ratio']
 
-    # 5. 최종 컬럼 정리
-    final_cols = [
-        'RENT_PRICE', 'ESTIMATED_MARKET_PRICE', 'PUBLIC_PRICE',
-        'jeonse_ratio', 'hug_risk_ratio',
-        'total_risk_ratio',  # 순수 (전세+실제빚)/시세
-        'estimated_loan_ratio',  # (=risk_factor_score) 정성적 위험 점수
-        'building_age', 'is_illegal', 'simple_type', 'main_use',
-        'is_trust_owner', 'short_term_weight'
-    ]
+        # 피처 다시 계산
+        feats = calculate_risk_features(
+            deposit_amount=row['RENT_PRICE'],
+            market_price=row['ESTIMATED_MARKET_PRICE'],
+            real_debt=fake_debt,  # <--- 가짜 빚 주입!
+            main_use=row['main_use'],
+            usage_approval_date=row['use_apr_day'],
+            is_illegal=int(row['is_violating_building'] == 'Y'),
+            is_trust_owner=0,  # 일단 신탁은 아니라고 가정
+            short_term_weight=0.0
+        )
+        # 정답지도 '위험'으로 강제 설정할 것이므로 덮어쓰기
+        return pd.Series(feats)
 
-    df_result = df_final[final_cols].copy()
-    print(f"--- 데이터 가공 완료: {len(df_result)}건 생성 ---")
-    return df_result
+    augmented_features = safe_samples.apply(inject_fake_debt, axis=1)
+    augmented_df = pd.concat([safe_samples[df_merged.columns], augmented_features], axis=1)
+
+    # 3. 원본 데이터와 합치기
+    df_final = pd.concat([df_final, augmented_df], axis=0).reset_index(drop=True)
+
+    print(f"-> 데이터 증강 완료: 총 {len(df_final)}건 (원본 + 가상채권데이터)")
+    return df_final
 
 if __name__ == "__main__":
     # 테스트 실행

@@ -1,203 +1,298 @@
-import sqlite3
-import os
 
-# 1. DB 파일 경로 설정 (이 파일 기준으로 상위 폴더에 저장)
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.abspath(os.path.join(BASE_DIR, '..', 'local_fraud_db.sqlite'))
+from sqlalchemy import  text
+
+from app.core.config import (
+    get_engine,
+    get_db_session,
+    get_db,
+    get_settings
+)
+
+# 외부에서 사용할 수 있도록 re-export
+__all__ = ['get_engine', 'get_db_session', 'get_db', 'get_connection', 'init_db']
 
 def get_connection():
-    """DB 연결 객체를 반환하는 헬퍼 함수"""
-    return sqlite3.connect(DB_PATH)
+    """
+    Raw connection 반환 (레거시 호환용)
+    가능하면 get_db_session() 사용을 권장합니다.
+    """
+    return get_engine().connect()
 
 def init_db():
-    """
-    모든 테이블 초기화
-    1. 작업 로그 (중복 방지)
-    2. 집합건축물대장 전유부 (아파트, 빌라, 오피스텔 - 호수별 소유)
-    3. 집합건축물대장 표제부
-    """
-    print(f"[DB Manager] 초기화 및 테이블 점검 시작: {DB_PATH}")
+    """MySQL 테이블 초기화"""
+    settings = get_settings()
+    print(f"[DB Manager] MySQL 테이블 초기화 시작 ({settings.DB_HOST}:{settings.DB_PORT}/{settings.DB_NAME})")
 
-    conn = get_connection()
-    cur = conn.cursor()
+    engine = get_engine()
 
-    # !주의: 테이블 초기화
-    # cur.execute("DROP TABLE IF EXISTS api_job_log")
-    # cur.execute("DROP TABLE IF EXISTS public_price_history")
-    # cur.execute("DROP TABLE IF EXISTS building_info")
-    # cur.execute("DROP TABLE IF EXISTS building_title_info")
+    # SQLAlchemy 엔진을 통해 직접 연결
+    with engine.begin() as conn:
+        # -----------------------------------------------------
+        # 1. building_info (건물 기본 정보 - 전유부 위주)
+        # -----------------------------------------------------
+        conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS building_info (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+                        unique_number VARCHAR(50) NOT NULL UNIQUE,
+                        building_id_code VARCHAR(50),
 
-    """
-    테이블 명: building_info
-    테이블 구조
-    unique_number: 고유번호(2823710100...) - API 연동시 Key
-    building_id_code: 건물ID(222004...)
+                        road_address VARCHAR(255) NOT NULL,
+                        lot_address VARCHAR(255),
+                        detail_address VARCHAR(100),
 
-    road_address: 도로명 주소
-    lot_address: 지번주소
-    detail_address: 상세주소 (101동 302호)
+                        exclusive_area DECIMAL(10, 2) NOT NULL,
+                        main_use VARCHAR(50) NOT NULL,
+                        structure_type VARCHAR(50),
 
-    exclusive_area: 전용면적
-    main_use: 주용도
-    structure_type: 구조(철근콘크리트 등)
+                        owner_name VARCHAR(100),
+                        ownership_changed_date DATE,
+                        ownership_cause VARCHAR(50),
+                        is_violating_building CHAR(1) DEFAULT 'N',
 
-    owner_name: 소유자명
-    ownership_changed_date: 소유권 변동일 (최근 변경 시 위험 경고용)
-    ownership_cause: 변동원인(매매/증여/신탁 등 - 신탁일 경우 위험)
-    is_violating_building: 위반건축물 여부 (Y/N)
-    """
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS building_info (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+                """))
 
-            unique_number VARCHAR(50) NOT NULL UNIQUE,
-            building_id_code VARCHAR(50),
+        # -----------------------------------------------------
+        # 2. building_title_info (건물 표제부 정보 - 주차장, 승강기 등)
+        # -----------------------------------------------------
+        conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS building_title_info (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
 
-            road_address VARCHAR(255) NOT NULL,
-            lot_address VARCHAR(255),
-            detail_address VARCHAR(100),
+                        -- 1. 식별 정보
+                        unique_number VARCHAR(50) NOT NULL UNIQUE,
+                        sigungu_code VARCHAR(10),
+                        bjdong_code VARCHAR(10),
+                        bunji VARCHAR(20),
 
-            exclusive_area DECIMAL(10, 2) NOT NULL,
-            main_use VARCHAR(50) NOT NULL,
-            structure_type VARCHAR(50),
+                        -- 2. 주소 및 건물명
+                        road_address VARCHAR(255),
+                        detail_address VARCHAR(100),
+                        dong_name VARCHAR(50),
 
-            owner_name VARCHAR(100),
-            ownership_changed_date DATE,
-            ownership_cause VARCHAR(50),
-            is_violating_building CHAR(1) DEFAULT 'N',
+                        -- 3. 건물 스펙
+                        main_use VARCHAR(100),
+                        structure_type VARCHAR(100),
+                        total_floor_area DECIMAL(15, 2),
 
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-    ''')
+                        household_cnt INT DEFAULT 0,
+                        grnd_flr_cnt INT DEFAULT 0,
+                        und_flr_cnt INT DEFAULT 0,
 
-    # ---------------------------------------------------------
-    # 2. updated_at 자동 갱신을 위한 Trigger 생성
-    # ---------------------------------------------------------
-    cur.execute('''
-        CREATE TRIGGER IF NOT EXISTS update_building_info_modtime
-        AFTER UPDATE ON building_info
-        BEGIN
-            UPDATE building_info
-            SET updated_at = CURRENT_TIMESTAMP
-            WHERE id = OLD.id;
-        END;
-    ''')
+                        -- 4. 편의 시설
+                        parking_cnt INT DEFAULT 0,
+                        elevator_cnt INT DEFAULT 0,
 
-    """
-    테이블 명: public_price_history
-    테이블 구조
-    building_info_id: FK
-    base_date: 기준일
-    price:  공시가격 (원 단위)
-    created_at: 생성일
-    """
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS public_price_history (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        building_info_id INTEGER NOT NULL,
-        base_date DATE NOT NULL,
-        price DECIMAL(15, 0) NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (building_info_id) REFERENCES building_info(id) ON DELETE CASCADE
-    );
-    ''')
+                        -- 5. 리스크 및 가치 지표
+                        use_apr_day DATE,
+                        is_violating CHAR(1) DEFAULT 'N',
 
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS building_title_info (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+                """))
 
-            -- 1. 식별 정보
-            unique_number VARCHAR(50) NOT NULL UNIQUE, -- 고유번호 (PK)
-            sigungu_code VARCHAR(10),
-            bjdong_code VARCHAR(10),
-            bunji VARCHAR(20),
+        # -----------------------------------------------------
+        # 3. public_price_history (공시지가 이력)
+        # -----------------------------------------------------
+        conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS public_price_history (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+                        building_info_id INT NOT NULL,
+                        base_date DATE NOT NULL,
+                        price DECIMAL(15, 0) NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 
-            -- 2. 주소 및 건물명
-            road_address VARCHAR(255),
-            detail_address VARCHAR(100),               -- 건물명 (예: 광일아파트)
-            dong_name VARCHAR(50),                     -- 동 명칭 (예: 1동, A동)
+                        FOREIGN KEY (building_info_id) REFERENCES building_info(id) ON DELETE CASCADE
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+                """))
 
-            -- 3. 건물 스펙
-            main_use VARCHAR(100),                     -- 주용도 (아파트)
-            structure_type VARCHAR(100),               -- 주구조 (철근콘크리트조 - 내구연한 판단용)
-            total_floor_area DECIMAL(15, 2),           -- 연면적
+        # -----------------------------------------------------
+        # 4. api_price_log (API 호출 이력 - 실거래/전세 데이터)
+        # -----------------------------------------------------
+        conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS api_price_log (
+                        sigungu_code VARCHAR(10),
+                        deal_ymd VARCHAR(6),
+                        data_type VARCHAR(10),
+                        collected_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (sigungu_code, deal_ymd, data_type)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+                """))
 
-            household_cnt INTEGER DEFAULT 0,           -- 총 세대수 (55세대 - 나홀로 아파트 여부 판단)
-            grnd_flr_cnt INTEGER DEFAULT 0,            -- 지상 층수 (5층)
-            und_flr_cnt INTEGER DEFAULT 0,             -- 지하 층수 (1층)
+        # -----------------------------------------------------
+        # 5. job_sgg_history (작업 상태 관리)
+        # -----------------------------------------------------
+        conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS job_sgg_history (
+                        sgg_code VARCHAR(10) PRIMARY KEY,
+                        status VARCHAR(20) DEFAULT 'READY',
+                        last_worked_at TIMESTAMP,
+                        message TEXT
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+                """))
 
-            -- 4. 편의 시설 (삶의 질 & 가격 영향)
-            parking_cnt INTEGER DEFAULT 0,             -- 주차대수 (자주식+기계식 합산)
-            elevator_cnt INTEGER DEFAULT 0,            -- 승강기대수 (승용+비상용)
+        # [데이터 초기화] meta_bjdong_codes 테이블이 존재한다고 가정
+        # MySQL에서는 INSERT OR IGNORE 대신 INSERT IGNORE 사용
+        # (주의: meta_bjdong_codes 테이블이 먼저 생성되어 있어야 실행됨)
+        try:
+            conn.execute(text("""
+                        INSERT IGNORE INTO job_sgg_history (sgg_code, status)
+                        SELECT DISTINCT sgg_code, 'READY'
+                        FROM meta_bjdong_codes
+                        WHERE sgg_code IS NOT NULL;
+                    """))
+        except Exception as e:
+            print(f"[Warning] job_sgg_history 초기화 실패 (meta_bjdong_codes 테이블 없음?): {e}")
 
-            -- 5. 리스크 및 가치 지표
-            use_apr_day DATE,                          -- 사용승인일 (1985-01-15 -> 재건축 가능성/노후도)
-            is_violating CHAR(1) DEFAULT 'N',          -- 위반건축물 여부 (노란 딱지)
+        # -----------------------------------------------------
+        # 6. regional_stats (지역별 통계 요약 - 성능 최적화용)
+        # -----------------------------------------------------
+        conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS regional_stats (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+                        region_code VARCHAR(10) NOT NULL,   
+                        region_name VARCHAR(50),            
+                        month VARCHAR(7) NOT NULL,          
+                        avg_ratio DECIMAL(5, 1),            
+                        tx_count INT,                   
+                        risk_level VARCHAR(10),             
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-    ''')
+                        UNIQUE KEY uk_region_month (region_code, month),
+                        INDEX idx_month (month)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+                """))
 
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS api_price_log (
-            sigungu_code TEXT,      -- 시군구 코드 (예: 41610)
-            deal_ymd TEXT,          -- 조회 년월 (예: 202411)
-            data_type TEXT,         -- 데이터 타입 ('TRADE', 'RENT')
-            collected_at DATETIME DEFAULT CURRENT_TIMESTAMP, -- 수집 시점
-            PRIMARY KEY (sigungu_code, deal_ymd, data_type)
-        );
-    ''')
+        # -----------------------------------------------------
+        # 7. risk_analysis_result (전세사기 위험도 분석 결과)
+        # -----------------------------------------------------
+        conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS risk_analysis_result (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
 
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS job_sgg_history (
-            sgg_code VARCHAR(10) PRIMARY KEY,
-            status VARCHAR(20) DEFAULT 'READY',  -- READY, DOING, DONE(혹은 FINISHED)
-            last_worked_at TIMESTAMP,            -- 이 시간이 가장 옛날인 것부터 다시 시작
-            message TEXT                         -- 결과 메시지 등
-        );
-    ''')
+                        address_key VARCHAR(255),
+                        building_info_id INT,
 
-    # 2. 초기 데이터 동기화 (없는 지역만 추가)
-    # MySQL의 INSERT IGNORE와 유사한 SQLite 문법
-    cur.execute("""
-        INSERT OR IGNORE INTO job_sgg_history (sgg_code, status)
-        SELECT DISTINCT sgg_code, 'READY'
-        FROM meta_bjdong_codes
-        WHERE sgg_code IS NOT NULL;
-    """)
+                        jeonse_ratio DECIMAL(5, 2),
+                        hug_safe_limit BIGINT,
+                        hug_risk_ratio DECIMAL(5, 2),
+                        total_risk_ratio DECIMAL(5, 2),
+                        estimated_loan_amount BIGINT,
 
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS risk_analysis_result (
-            id INT AUTO_INCREMENT PRIMARY KEY,
+                        risk_level VARCHAR(20),
+                        risk_score INT,
+
+                        analyzed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+                        INDEX idx_risk_address (address_key),
+                        INDEX idx_risk_level (risk_level)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+                """))
+
+        # -----------------------------------------------------
+        # [수정] official_price_raw (공시지가 원천 데이터)
+        # SQLite 문법(AUTOINCREMENT)을 MySQL 문법(AUTO_INCREMENT)으로 변경
+        # -----------------------------------------------------
+        conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS official_price_raw (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+
+                        -- 1. 핵심 식별자 (검색용)
+                        pnu VARCHAR(19) NOT NULL,       -- PNU
+                        sigungu_code VARCHAR(5),
+                        bjdong_code VARCHAR(5),
+
+                        -- 2. 상세 주소
+                        dong_name VARCHAR(50),
+                        ho_name VARCHAR(50),
+
+                        -- 3. 데이터
+                        price DECIMAL(15, 0),
+                        exclusive_area DECIMAL(10, 2),
+                        base_year VARCHAR(4),
+
+                        -- 4. 기타
+                        complex_name VARCHAR(100),
+                        road_address VARCHAR(255),
+
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+                        -- [중요] 조회 속도를 위해 PNU에 인덱스 추가
+                        INDEX idx_pnu (pnu)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+                """))
+
+        # -----------------------------------------------------
+        # 8. raw_rent (국토부 전월세 실거래가 원천 데이터)
+        # -----------------------------------------------------
+        conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS raw_rent (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+
+                        시군구 VARCHAR(50),
+                        법정동 VARCHAR(50),
+                        본번 VARCHAR(20),
+                        부번 VARCHAR(20),
+
+                        보증금 VARCHAR(50),    -- '50,000' 같은 문자열 처리를 위해 VARCHAR 권장
+                        월세 VARCHAR(50),
+
+                        계약일 VARCHAR(20),    -- '20240101' 형태
+                        계약유형 VARCHAR(20),  -- 신규/갱신
+                        건물유형 VARCHAR(20),  -- 아파트/연립다세대 등
+
+                        층 VARCHAR(20),
+                        전용면적 VARCHAR(30),
+                        건물명 VARCHAR(100),
+                        건축년도 VARCHAR(10),
+
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+                        -- 조회 성능 향상을 위한 인덱스
+                        INDEX idx_rent_sigungu (시군구),
+                        INDEX idx_rent_date (계약일)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+                """))
+
+        # -----------------------------------------------------
+        # 9. raw_trade (국토부 매매 실거래가 원천 데이터)
+        # -----------------------------------------------------
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS raw_trade (
+                id INT AUTO_INCREMENT PRIMARY KEY,
     
-            address_key VARCHAR(255),       -- 시군구+법정동+본번+부번 (Join용 Key)
-            building_info_id INT,           -- building_info 테이블 FK
-            
-            -- 2. 핵심 분석 지표 (숫자)
-            jeonse_ratio DECIMAL(5, 2),     -- 전세가율 (예: 0.85)
-            hug_safe_limit BIGINT,
-            hug_risk_ratio DECIMAL(5, 2),   -- HUG 기준 위험도
-            total_risk_ratio DECIMAL(5, 2), -- 깡통전세(부채포함) 위험도
-            estimated_loan_amount BIGINT,   -- 시뮬레이션된 선순위 대출금
-            
-            -- 3. 최종 판단 결과
-            risk_level VARCHAR(20),         -- 'SAFE', 'RISKY'
-            risk_score INT,                 -- 100점 만점 환산 점수
-            
-            -- 4. 언제 분석했는가?
-            analyzed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            
-            -- (옵션) 빠른 조회를 위한 인덱스
-            INDEX idx_address (address_key),
-            INDEX idx_risk_level (risk_level)
-        );
-    """)
-    conn.commit()
-    conn.close()
-    print("[DB Manager] 테이블 점검 완료")
+                시군구 VARCHAR(50),
+                법정동 VARCHAR(50),
+                본번 VARCHAR(20),
+                부번 VARCHAR(20),
+    
+                거래금액 VARCHAR(50),  -- 쉼표 포함 가능성 고려하여 문자열 저장
+                계약일 VARCHAR(20),
+    
+                전용면적 VARCHAR(30),
+                층 VARCHAR(20),
+                건물명 VARCHAR(100),
+                건축년도 VARCHAR(10),
+                건물유형 VARCHAR(20),
+    
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    
+                -- 조회 성능 향상을 위한 인덱스
+                INDEX idx_trade_sigungu (시군구),
+                INDEX idx_trade_date (계약일)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        """))
 
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS regions (
+                region_code VARCHAR(10) PRIMARY KEY COMMENT '시군구 코드 (예: 11110)',
+                region_name VARCHAR(50) NOT NULL COMMENT '시군구 명 (예: 서울특별시 종로구)'
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        """))
+        print("[DB Manager] 모든 MySQL 테이블 생성 완료")
 
 # 테스트용 실행 코드 (이 파일을 직접 실행했을 때만 동작)
 if __name__ == "__main__":

@@ -1,15 +1,14 @@
-import os, time, sys, re
+import os, time, sys
 from dotenv import load_dotenv
 import requests
 import json
-import sqlite3
 import urllib.parse
 import pandas as pd
 # [수정] 경로 문제 해결을 위한 조건부 임포트
 try:
-    # 1. 외부(predict.py 등)에서 패키지로 불러올 때 (프로젝트 루트 기준)
+    # 1. 외부(predict_service.py 등)에서 패키지로 불러올 때 (프로젝트 루트 기준)
     from scripts.db_manager import init_db, get_connection
-    from scripts.kakao_localmap_api import get_building_name_from_kakao, get_road_address_from_kakao, get_all_address_and_building_from_kakao
+    from app.utils.kakao_localmap_api import get_building_name_from_kakao, get_road_address_from_kakao, get_all_address_and_building_from_kakao
 except ModuleNotFoundError:
     # 2. 이 파일을 직접 실행할 때 (현재 폴더 기준)
     from db_manager import init_db, get_connection
@@ -24,10 +23,10 @@ DB_PATH = os.path.abspath(os.path.join(BASE_DIR, '..', 'local_fraud_db.sqlite'))
 # 1. 설정 (Configuration) - 다중 계정 지원
 # ==========================================
 # 계정 목록 (환경변수에 _1, _2 접미사 붙은 키 필요)
-CLIENT_ID = os.getenv("CLIENT_ID_1")
-CLIENT_SECRET = os.getenv("CLIENT_SECRET_1")
-CODEF_USER_ID = os.getenv("CODEF_USER_ID_1")
-CODEF_USER_RSA_PASSWORD = os.getenv("CODEF_USER_RSA_PASSWORD_1")
+CLIENT_ID = os.getenv("CLIENT_ID_2")
+CLIENT_SECRET = os.getenv("CLIENT_SECRET_2")
+CODEF_USER_ID = os.getenv("CODEF_USER_ID_2")
+CODEF_USER_RSA_PASSWORD = os.getenv("CODEF_USER_RSA_PASSWORD_2")
 
 # API 엔드포인트
 TOKEN_URL = "https://oauth.codef.io/oauth/token"
@@ -278,6 +277,8 @@ def get_dong_list_step(token, address):
         return [{'reqDong': '단일건물', 'commDongNum': ''}], data
     elif code == 'CF-00000':
         return [], data
+    else:
+        print(f"발생 코드 (조회 실패 가능성 높음): {code}")
 
     return [], res
 
@@ -774,6 +775,100 @@ def fetch_target_middle_unit(token, target_address, original_address=None):
     else:
         return False
 
+def fetch_specific_unit(token, target_address, target_dong_name, target_ho_name, original_address=None):
+    """
+    지정된 동(target_dong_name)과 호(target_ho_name)를 찾습니다.
+    """
+    addr_log = original_address if original_address else target_address
+    disp_dong = target_dong_name if target_dong_name else "단일건물"
+    print(f"      [Sub-Task] '{addr_log}' 지정 타겟({disp_dong} / {target_ho_name}) 수집 시도...")
+
+    target_dong_clean = ""
+    if target_dong_name:
+        target_dong_clean = str(target_dong_name).replace("동", "").strip()
+    target_ho_clean = str(target_ho_name).replace("호", "").strip()
+
+    # ---------------------------------------------------------
+    # 1. 동 목록 확보 및 탐색
+    # ---------------------------------------------------------
+    dong_list, res_data = get_dong_list_step(token, target_address)
+
+    if not dong_list:
+        print("      [Error] 동 목록 조회 실패")
+        return False
+
+    found_dong = None
+
+    # 동 이름을 입력하지 않음 -> 단일건물
+    if not target_dong_clean:
+        if len(dong_list) == 1:
+            found_dong = dong_list[0]
+            d_real_name = urllib.parse.unquote_plus(found_dong.get('reqDong', ''))
+            print(f"      [Auto-Select] 단일 건물 자동 선택: '{d_real_name}'")
+        else:
+            # 입력은 없는데 목록이 여러 개 -> 모호함
+            print(f"      [Error] 입력한 동은 공란인데, 검색된 동이 {len(dong_list)}개 입니다. 동 구분이 필요합니다.")
+            return False
+    else:
+        # 동 목록에서 지정된 동 이름 찾기
+        for d in dong_list:
+            # API 리턴값 디코딩 및 공백 제거
+            d_name_raw = urllib.parse.unquote_plus(d.get('reqDong', '')).strip()
+            # '동' 이름 제거 (101동 -> 101)
+            d_name_clean = d_name_raw.replace("동", "").strip()
+
+            if d_name_clean == target_dong_clean:
+                found_dong = d
+                print(f"      [Match] 동 찾음: 입력('{target_dong_name}') == 데이터('{d_name_raw}')")
+                break
+        if not found_dong:
+            # [종료 조건 1] 지정된 동이 목록에 없음
+            print(f"      [Error] 요청한 '{target_dong_name}'이(가) 검색된 동 목록에 없습니다. 작업을 중단합니다.")
+            return False
+
+    dong_code = found_dong.get('commDongNum')
+    print(f"      [Check] 동 확인 완료: '{target_dong_name}'")
+
+    # ---------------------------------------------------------
+    # 2. 호 목록 확보 및 탐색
+    # ---------------------------------------------------------
+    ho_list = get_ho_list_step(token, target_address, dong_code)
+
+    if not ho_list:
+        print("      [Error] 호 목록 조회 실패")
+        return False
+
+    found_ho = None
+
+    # 호 목록에서 지정된 호 이름 찾기
+    for h in ho_list:
+        h_name_raw = urllib.parse.unquote_plus(h.get('reqHo', '')).strip()
+        h_name_clean = h_name_raw.replace("호", "").strip()
+        if h_name_clean == target_ho_clean:
+            found_ho = h
+            print(f"      [Match] 호 찾음: 입력('{target_ho_name}') == 데이터('{h_name_raw}')")
+            break
+
+    if not found_ho:
+        # [종료 조건 2] 지정된 호가 목록에 없음
+        print(f"      [Error] 요청한 '{target_ho_name}'이(가) 검색된 호 목록에 없습니다. 작업을 중단합니다.")
+        return False
+
+    ho_code = found_ho['commHoNum']
+    print(f"      [Check] 호 확인 완료: '{target_ho_name}'")
+
+    # ---------------------------------------------------------
+    # 3. 최종 데이터 조회 및 저장
+    # ---------------------------------------------------------
+    final_res = fetch_final_data_step(token, target_address, dong_code, ho_code)
+
+    if final_res and final_res['result']['code'] == 'CF-00000':
+        parse_and_save(final_res, target_dong_name, target_ho_name)
+        return True
+    else:
+        print("      [Error] 최종 데이터 조회 실패")
+        return False
+
 # 서울, 인천, 경기 지역의 랜덤 순서로 시군구 코드를 반환
 def get_random_sgg_codes():
     conn = get_connection()
@@ -804,4 +899,6 @@ if __name__ == "__main__":
     for target_sgg in random_sgg_rows:
         # 루프별로 시군구 지역별 아파트/오피스텔/연립다세대 각 1개씩 조회
         get_targets_from_rent_db(CURRENT_TOKEN,target_sgg)
+
+    # fetch_specific_unit(CURRENT_TOKEN, "경기도 포천시 신읍동 167-4 은하아파트", "B", "306")
 
