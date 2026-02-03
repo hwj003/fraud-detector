@@ -1,46 +1,222 @@
-# 전세사기 예측 모델 
-### API 엔드포인트
-/predict - post 
-### 입력 파라미터 (json body)
-address: 분석할 매물의 도로명 또는 지번 주소 (예: '인천광역시 부평구 산곡동 145') \
-deposit: 계약하려는 전세 보증금 액수 (단위: 만원, 예: 20000)
-### 입력 예시
-{ \
-    "address": 인천광역시 부평구 산곡동 145, \
-    "deposit": 20000\
-} 
-### 출력 예시
+# 🏠 전세사기 위험도 탐지 시스템 (Fraud Detector)
+
+전세 계약 시 사기 피해를 예방하기 위한 AI 기반 위험도 분석 서비스입니다. 건축물대장과 등기부등본을 OCR로 분석하고, 실거래가/공시지가 데이터를 활용하여 종합적인 전세사기 위험도를 산출합니다.
+
+---
+
+## 📌 주요 기능
+
+### 1. OCR 기반 문서 분석
+- **건축물대장 분석**: Gemini API를 활용한 이미지 OCR
+- **등기부등본 분석**: PDF 파싱 및 권리관계 추출
+- **문서 매칭 검증**: 두 문서가 동일 물건인지 자동 검증
+
+### 2. 시세 조회 및 분석
+- 국토교통부 실거래가 API 연동 (매매/전월세)
+- 공시지가 데이터 활용
+- 전세가율 자동 계산
+
+### 3. AI 위험도 예측
+- Random Forest 모델 기반 위험도 점수 산출
+- 다중 위험 요인 분석:
+  - 전세가율 (LTV)
+  - 선순위 채권 금액
+  - 신탁 등기 여부
+  - 위반 건축물 여부
+  - 소유 기간 (깡통전세 위험)
+  - 건물 노후도
+
+### 4. HUG 전세보증보험 진단
+- 보증 가입 가능 여부 판단
+- 안전 보증 한도액 계산
+
+### 5. 지역별 통계 시각화
+- 지역별 전세가율 현황
+- 위험 등급별 거래 분포
+- 시계열 추이 분석
+
+---
+
+## 🛠 기술 스택
+
+| 구분 | 기술 |
+|------|------|
+| **Backend** | FastAPI, Python 3.10+ |
+| **Database** | MySQL (SQLAlchemy ORM) |
+| **AI/ML** | scikit-learn, Random Forest |
+| **OCR** | Google Gemini API |
+| **외부 API** | 국토교통부 실거래가 API, 카카오 로컬 API |
+| **인프라** | Docker (선택) |
+
+---
+
+## 🚀 설치 및 실행
+
+### 1. 환경 설정
+
+```bash
+# 저장소 클론
+git clone https://github.com/your-username/fraud-detector.git
+cd fraud-detector
+
+# 가상환경 생성 및 활성화
+python -m venv venv
+source venv/bin/activate  # Windows: venv\Scripts\activate
+
+# 의존성 설치
+pip install -r requirements.txt
+```
+
+### 2. 환경 변수 설정
+
+`.env` 파일을 생성하고 다음 항목을 설정합니다:
+
+```env
+# 데이터베이스
+DB_HOST=localhost
+DB_PORT=3306
+DB_USER=your_user
+DB_PASSWORD=your_password
+DB_NAME=fraud_detector
+
+# 외부 API 키
+API_SERVICE_KEY=국토교통부_API_키
+KAKAO_REST_API_KEY=카카오_API_키
+GEMINI_API_KEY=구글_Gemini_API_키
+
+# 앱 설정
+APP_ENV=local
+```
+
+### 3. 데이터베이스 초기화
+
+```bash
+# 테이블 생성 (자동)
+python -c "from app.core import init_db; init_db()"
+
+# 법정동 코드 등록
+python scripts/setup_region_codes.py
+```
+
+### 4. 서버 실행
+
+```bash
+# 개발 모드
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+
+# 또는
+python app/main.py
+```
+
+서버 실행 후 API 문서 확인: `http://localhost:8000/docs`
+
+---
+
+## 📡 API 엔드포인트
+
+### 위험도 분석
+
+```http
+POST /predict
+Content-Type: multipart/form-data
+```
+
+| 파라미터 | 타입 | 필수 | 설명 |
+|----------|------|------|------|
+| `deposit` | int | ✅ | 보증금 (만원) |
+| `address` | string | ✅ | 주소 (시세 조회용) |
+| `ledger_files` | file[] | ✅ | 건축물대장 이미지 (PNG/JPG, 최대 5개) |
+| `registry_files` | file[] | ✅ | 등기부등본 PDF (최대 3개) |
+
+#### 응답 예시
+
+```json
 {
-    "address": "인천광역시 부평구 산곡동 145", // 주소 \
-    "building_name": "311동 101호", // 건축물대장상 건물명 및 동/호수 \
-    "deposit": "18000만원", // 전세 보증금 \
-    "risk_score": 42.0, // AI 모델이 예측한 전세사기 위험 확률 (0 ~ 100점) \
-    "risk_level": "SAFE", // 위험 등급 (SAFE: 안전, RISKY: 위험)\
-    "details": { \
-        "hug_ratio": 86.1, // HUG 전세보증보험 가입 한도 대비 전세가 비율 (%, 100% 초과 시 가입 불가) \
-        "total_ratio": 97.5, // 깡통전세 위험도: (추정 대출금 + 전세금) / 추정 시세 비율 (%, 100% 초과 시 위험)\
-        "is_trust": false, // 신탁 등기 여부 (True: 신탁사 소유로 주의 필요, False: 일반 매물)\
-        "is_short_term": false // 집주인 단기 소유 여부 (True: 소유권 이전 2년 미만, False: 장기 보유)\
-    } \
+  "meta": {
+    "code": 200,
+    "message": "전세사기 위험도 분석 완료",
+    "timestamp": "2026-02-04T14:30:45"
+  },
+  "data": {
+    "address": "인천광역시 부평구 삼산동 167-15",
+    "deposit": 35000000,
+    "market_price": 61000000,
+    "price_source": "DB_Trade",
+    "risk_score": 41.0,
+    "risk_level": "SAFE",
+    "major_risk_factors": [
+      {
+        "type": "HIGH_LTV",
+        "severity": "MEDIUM",
+        "message": "전세가율이 다소 높습니다 (57.4%)"
+      }
+    ],
+    "hug_result": {
+      "is_eligible": true,
+      "safe_limit": 43260000,
+      "coverage_ratio": 100.0,
+      "message": "HUG 전세보증보험 가입 가능"
+    },
+    "details": {
+      "jeonse_ratio": 57.4,
+      "senior_debt": 0,
+      "is_illegal_building": false,
+      "is_trust": false,
+      "building_age": 15.3
+    },
+    "recommendations": [
+      "HUG 전세보증보험 가입을 권장합니다",
+      "전입신고 및 확정일자를 반드시 받으세요"
+    ]
+  }
 }
+```
 
-공공데이터 api 신청 및 인증 키 필요 (.env에 추가) 
-### 사용 데이터 목록 
-##### 국토교통부_오피스텔 전월세 실거래가 자료  https://www.data.go.kr/data/15126475/openapi.do 
-##### 국토교통부_오피스텔 매매 실거래가 자료 https://www.data.go.kr/data/15126464/openapi.do
-##### 국토교통부_연립다세대 전월세 실거래가 자료 https://www.data.go.kr/data/15126473/openapi.do
-##### 국토교통부_연립다세대 매매 실거래가 자료 https://www.data.go.kr/data/15126467/openapi.do
-##### 국토교통부_아파트 매매 실거래가 자료 https://www.data.go.kr/data/15126469/openapi.do
-##### 국토교통부_아파트 전월세 실거래가 자료 https://www.data.go.kr/data/15126474/openapi.do
-##### 세움터 집합 건축물대장 (표제부/전유부)
+### 상태 확인
 
+```http
+GET /
+```
 
-### 사용 방법 (실행순서 중요) 
-1. pip install -r requirements.txt  라이브러리 설치
-2. python setup_region_codes.py 법정동코드 추가
-3. python fetch_trade_data.py 실거래가 데이터 수집 
-4. python fetch_rent_data.py 전월세 데이터 수집
-5. python train_model.py 모델 훈련
-6. python run_api.py 실행 (1~5번과정은 한 번만 실행하면 됨.)
+---
 
- 
+## 📊 데이터 수집
+
+### 실거래가 데이터 수집
+
+```bash
+# 전월세 실거래가
+python -m scripts.fetch_data.fetch_rent_data
+
+# 매매 실거래가
+python -m scripts.fetch_data.fetch_trade_data
+```
+
+### 모델 학습
+
+```bash
+python scripts/train_model.py
+```
+
+---
+
+## 🔒 위험 등급 기준
+
+| 등급 | 점수 범위 | 설명 |
+|------|-----------|------|
+| 🟢 SAFE | 0 ~ 40 | 안전 |
+| 🟡 CAUTION | 41 ~ 70 | 주의 필요 |
+| 🔴 RISKY | 71 ~ 100 | 위험 |
+
+### 주요 위험 요인
+
+| 요인 | 설명 |
+|------|------|
+| `HIGH_LTV` | 전세가율 80% 이상 |
+| `SENIOR_DEBT` | 선순위 채권 존재 |
+| `TRUST_PROPERTY` | 신탁 등기된 부동산 |
+| `ILLEGAL_BUILDING` | 위반 건축물 |
+| `OWNERSHIP_PERIOD` | 소유 기간 6개월 미만 |
+| `OLD_BUILDING` | 건물 노후도 30년 이상 |
+
+---
