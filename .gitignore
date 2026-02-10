@@ -11,13 +11,11 @@
 .venv/
 __pycache__/
 *.pth
-*.pkl
 .idea/
 
 # csv, data
 data
 notebook
-models
 assets
 *.csv
 ocr_test
