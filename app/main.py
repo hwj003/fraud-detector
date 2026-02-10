@@ -1,13 +1,29 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+"""
+전세사기 위험도 분석 API (비동기 + Redis 캐싱 버전)
+
+변경사항 (v2):
+- /predict → 비동기 처리 (BackgroundTasks)
+  - 요청 접수 → 즉시 task_id 반환 (202 Accepted)
+  - 백그라운드에서 OCR + 예측 수행
+- /predict/{task_id} → 작업 상태/결과 조회 (폴링)
+- Redis 캐싱: 동일 주소+보증금+파일 조합 결과 재사용
+- /predict/cache → 캐시 무효화 API
+"""
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
-from typing import List
+from typing import List, Optional
 import shutil
 import os
+import uuid
+import asyncio
+import logging
 from datetime import datetime
+from functools import partial
 from fastapi.middleware.cors import CORSMiddleware
+
 from app.services.ocr.ledger_parser import extract_building_ledger
 from app.services.ocr.registry_parser import extract_real_estate_data
-from app.services.predict_service import predict_risk_with_ocr  # 새로 만들 함수
+from app.services.predict_service import predict_risk_with_ocr
 from app.router import stats
 from app.core import (
     get_settings,
@@ -16,11 +32,30 @@ from app.core import (
     reset_db_availability
 )
 from app.core.exceptions import DatabaseConnectionError, ServiceUnavailableError
-from app.services.document_validator import (
-    validate_document_match
+from app.services.document_validator import validate_document_match
+
+# Redis 모듈
+from app.core.redis_config import (
+    get_redis,
+    close_redis,
+    generate_cache_key,
+    generate_file_hash,
+    get_cached_result,
+    set_cached_result,
+    invalidate_cache,
+    set_task_status,
+    get_task_status,
+    health_check_redis,
+    TaskStatus,
 )
 
-app = FastAPI()
+logger = logging.getLogger(__name__)
+
+app = FastAPI(
+    title="Fraud Detector AI",
+    version="2.0",
+    description="전세사기 위험도 분석 API (비동기 + Redis 캐싱)"
+)
 
 settings = get_settings()
 origins = ["*"] if settings.APP_ENV == "local" else [
@@ -31,8 +66,8 @@ origins = ["*"] if settings.APP_ENV == "local" else [
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
-    allow_credentials=True,  # 필요시
-    allow_methods=["GET", "POST"],  # 필요한 것만
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["*"],
 )
 
@@ -42,11 +77,34 @@ ALLOWED_IMAGE_TYPES = {"image/png", "image/jpeg", "image/jpg"}
 ALLOWED_PDF_TYPES = {"application/pdf"}
 
 
+# =============================================================================
+# 앱 Lifecycle (Redis 연결/해제)
+# =============================================================================
+@app.on_event("startup")
+async def startup_event():
+    """앱 시작 시 Redis 연결"""
+    redis_client = await get_redis()
+    if redis_client:
+        logger.info("🚀 Redis 연결 완료")
+    else:
+        logger.warning("⚠️ Redis 없이 시작 (캐싱 비활성)")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """앱 종료 시 Redis 연결 해제"""
+    await close_redis()
+    logger.info("Redis 연결 종료")
+
+
+# =============================================================================
+# 유틸리티 함수
+# =============================================================================
 def validate_file_size(file: UploadFile, max_size_mb: int = MAX_FILE_SIZE_MB):
     """파일 크기 검증"""
-    file.file.seek(0, 2)  # 파일 끝으로 이동
-    file_size = file.file.tell()  # 현재 위치 = 파일 크기
-    file.file.seek(0)  # 다시 처음으로
+    file.file.seek(0, 2)
+    file_size = file.file.tell()
+    file.file.seek(0)
 
     if file_size > max_size_mb * 1024 * 1024:
         raise HTTPException(
@@ -79,136 +137,85 @@ def create_error_response(
         },
         "errors": errors
     }
-
     if suggestions:
         content["suggestions"] = suggestions
 
     return JSONResponse(status_code=status_code, content=content)
 
 
-# ============================================================
-# DB 연결 체크 의존성 (재사용 가능)
-# ============================================================
-async def verify_db_connection():
-    """
-    FastAPI 의존성: DB 연결 상태 확인
-
-    OCR 분석 전에 DB가 정상적으로 연결되어 있는지 확인합니다.
-    연결 실패 시 503 Service Unavailable 반환
-
-    사용법:
-        @app.post("/predict")
-        async def predict_risk(..., _=Depends(verify_db_connection)):
-            ...
-    """
-    # 캐시된 상태로 빠른 체크
-    if is_db_available():
-        return True
-
-    # 캐시가 없거나 이전에 실패했다면 재확인
-    reset_db_availability()
-
-    if not check_db_connection():
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "meta": {
-                    "code": 503,
-                    "message": "서비스를 일시적으로 사용할 수 없습니다",
-                    "timestamp": datetime.now().isoformat()
-                },
-                "errors": [{
-                    "field": "database",
-                    "message": "데이터베이스 연결을 확인할 수 없습니다. 잠시 후 다시 시도해주세요."
-                }],
-                "suggestions": [
-                    "네트워크 연결 상태를 확인해주세요",
-                    "잠시 후 다시 시도해주세요",
-                    "문제가 지속되면 관리자에게 문의해주세요"
-                ]
-            }
-        )
-
-    return True
-
+# =============================================================================
+# 헬스체크
+# =============================================================================
 @app.get("/", summary="서비스 상태 확인")
-def health_check():
+async def health_check():
+    redis_status = await health_check_redis()
     return {
         "status": "Healthy",
         "service": "Fraud Detector AI",
-        "version": "1.0"
+        "version": "2.0",
+        "redis": redis_status,
     }
+
 
 # 라우터 등록
 app.include_router(stats.router)
 
+
+# =============================================================================
+# 메인 예측 API (비동기 전환)
+# =============================================================================
 @app.post("/predict",
-          summary="파일 업로드 기반 정밀 분석",
+          status_code=202,
+          summary="전세사기 위험도 분석 요청 (비동기)",
           description="""
-          건축물대장(이미지)과 등기부등본(PDF)을 업로드하여 정밀 위험도 분석을 수행합니다.
-          
+          건축물대장(이미지)과 등기부등본(PDF)을 업로드하여 위험도 분석을 요청합니다.
+
+          **동작 방식:**
+          1. 요청 접수 → 즉시 `task_id` 반환 (202 Accepted)
+          2. 동일 요청의 캐시가 있으면 즉시 결과 반환 (200 OK)
+          3. `/predict/{task_id}` 로 진행 상태/결과 조회 (폴링)
+
           **파일 제약사항:**
           - 건축물대장: PNG, JPG, JPEG (최대 10MB, 최대 5개)
           - 등기부등본: PDF (최대 20MB, 최대 3개)
           """)
-async def predict_risk(
+async def predict_risk_endpoint(
+        background_tasks: BackgroundTasks,
         deposit: int = Form(..., description="보증금 (만원)", ge=0, le=1000000),
         address: str = Form(..., description="주소 (시세 조회용)", min_length=5, max_length=200),
         ledger_files: List[UploadFile] = File(default=None, description="건축물대장 이미지 (PNG/JPG)"),
-        registry_files: List[UploadFile] = File(default=None, description="등기부등본 파일 (PDF)")
+        registry_files: List[UploadFile] = File(default=None, description="등기부등본 파일 (PDF)"),
+        skip_cache: bool = Form(default=False, description="캐시 무시 여부 (True면 캐시 건너뜀)"),
 ):
-    """
-    개선된 파일 업로드 기반 위험도 분석
-
-    **응답 예시:**
-    ```json
-    {
-      "meta": {
-        "code": 200,
-        "message": "전세사기 위험도 분석 완료",
-        "timestamp": "2026-02-02T14:30:45"
-      },
-      "data": {
-        "address": "인천광역시 부평구 삼산동 167-15",
-        "deposit": 35000000,
-        "market_price": 61000000,
-        "price_source": "DB_Trade",
-        "risk_score": 41.0,
-        "risk_level": "SAFE",
-        "major_risk_factors": [...],
-        "hug_result": {...},
-        "details": {...},
-        "recommendations": [...]
-      }
-    }
-    ```
-    """
-
-    # === 입력 검증 ===
+    # === 1. 입력 검증 ===
     errors = []
 
-    # 건축물대장 필수 체크
     if not ledger_files or len(ledger_files) == 0:
         errors.append({
             "field": "ledger_files",
             "message": "건축물대장 파일은 필수입니다. 최소 1개 이상의 이미지를 업로드해주세요."
         })
 
-    # 등기부등본 필수 체크
     if not registry_files or len(registry_files) == 0:
         errors.append({
             "field": "registry_files",
             "message": "등기부등본 파일은 필수입니다. 최소 1개 이상의 PDF를 업로드해주세요."
         })
 
-    # 건축물대장 검증
-    if ledger_files and len(ledger_files) > 0:
-        if len(ledger_files) > 5:
-            errors.append({
-                "field": "ledger_files",
-                "message": "건축물대장은 최대 5개까지 업로드 가능합니다"
-            })
+    if ledger_files and len(ledger_files) > 5:
+        errors.append({
+            "field": "ledger_files",
+            "message": "건축물대장은 최대 5개까지 업로드 가능합니다"
+        })
 
+    if registry_files and len(registry_files) > 3:
+        errors.append({
+            "field": "registry_files",
+            "message": "등기부등본은 최대 3개까지 업로드 가능합니다"
+        })
+
+    # 파일 타입/크기 검증
+    if ledger_files:
         for idx, file in enumerate(ledger_files):
             try:
                 validate_file_type(file, ALLOWED_IMAGE_TYPES)
@@ -219,14 +226,7 @@ async def predict_risk(
                     "message": f"{file.filename}: {e.detail}"
                 })
 
-    # 등기부등본 검증
-    if registry_files and len(registry_files) > 0:
-        if len(registry_files) > 3:
-            errors.append({
-                "field": "registry_files",
-                "message": "등기부등본은 최대 3개까지 업로드 가능합니다"
-            })
-
+    if registry_files:
         for idx, file in enumerate(registry_files):
             try:
                 validate_file_type(file, ALLOWED_PDF_TYPES)
@@ -237,190 +237,382 @@ async def predict_risk(
                     "message": f"{file.filename}: {e.detail}"
                 })
 
-    # 에러가 있으면 400 반환
     if errors:
         return create_error_response(400, "입력 데이터 검증 실패", errors)
 
-    ocr_results = {
-        'ledger': {},
-        'registry': {}
-    }
+    # === 2. 파일 해시 생성 → 캐시 키 ===
+    file_hashes = []
+    file_contents = {}  # {filename: bytes} - 나중에 임시파일 저장용
 
-    # 1. 임시 파일 저장 경로 생성
-    temp_dir = "temp_uploads"
+    for file in (ledger_files or []):
+        content = await file.read()
+        file_hashes.append(generate_file_hash(content))
+        file_contents[f"ledger_{file.filename}"] = content
+        await asyncio.to_thread(file.file.seek, 0)
+
+    for file in (registry_files or []):
+        content = await file.read()
+        file_hashes.append(generate_file_hash(content))
+        file_contents[f"registry_{file.filename}"] = content
+        await asyncio.to_thread(file.file.seek, 0)
+
+    cache_key = generate_cache_key(address, deposit, file_hashes)
+
+    # === 3. 캐시 확인 ===
+    if not skip_cache:
+        cached_result = await get_cached_result(cache_key)
+        if cached_result:
+            logger.info(f"🎯 캐시 히트 - 즉시 응답: {cache_key}")
+            return JSONResponse(status_code=200, content=cached_result)
+
+    # === 4. 비동기 작업 생성 ===
+    task_id = str(uuid.uuid4())
+
+    # 작업 상태 초기화
+    await set_task_status(task_id, TaskStatus.PENDING, progress=0)
+
+    # 임시 파일 저장
+    temp_dir = f"temp_uploads/{task_id}"
     os.makedirs(temp_dir, exist_ok=True)
 
     ledger_paths = []
     registry_paths = []
+
+    for file in (ledger_files or []):
+        file_path = os.path.join(temp_dir, f"ledger_{datetime.now().timestamp()}_{file.filename}")
+        content_key = f"ledger_{file.filename}"
+        with open(file_path, "wb") as buffer:
+            buffer.write(file_contents[content_key])
+        ledger_paths.append(file_path)
+
+    for file in (registry_files or []):
+        file_path = os.path.join(temp_dir, f"registry_{datetime.now().timestamp()}_{file.filename}")
+        content_key = f"registry_{file.filename}"
+        with open(file_path, "wb") as buffer:
+            buffer.write(file_contents[content_key])
+        registry_paths.append(file_path)
+
+    # === 5. 백그라운드 작업 등록 ===
+    background_tasks.add_task(
+        _run_prediction_task,
+        task_id=task_id,
+        address=address,
+        deposit=deposit,
+        ledger_paths=ledger_paths,
+        registry_paths=registry_paths,
+        cache_key=cache_key,
+        temp_dir=temp_dir,
+    )
+
+    # === 6. 즉시 응답 (202 Accepted) ===
+    return JSONResponse(
+        status_code=202,
+        content={
+            "meta": {
+                "code": 202,
+                "message": "분석 요청이 접수되었습니다",
+                "timestamp": datetime.now().isoformat()
+            },
+            "data": {
+                "task_id": task_id,
+                "status": TaskStatus.PENDING,
+                "cache_key": cache_key,
+                "poll_url": f"/predict/{task_id}",
+                "estimated_seconds": 15,
+            }
+        }
+    )
+
+
+# =============================================================================
+# 작업 상태/결과 조회 (폴링)
+# =============================================================================
+@app.get("/predict/{task_id}",
+         summary="분석 작업 상태/결과 조회",
+         description="""
+         `/predict`에서 반환된 `task_id`로 진행 상태를 조회합니다.
+
+         **상태값:**
+         - `PENDING` → 대기 중
+         - `PROCESSING` → 분석 진행 중 (progress 0~100)
+         - `COMPLETED` → 완료 (result에 분석 결과 포함)
+         - `FAILED` → 실패 (error에 사유 포함)
+         """)
+async def get_prediction_status(task_id: str):
+    task_data = await get_task_status(task_id)
+
+    if not task_data:
+        return create_error_response(
+            404,
+            "작업을 찾을 수 없습니다",
+            [{"field": "task_id", "message": f"'{task_id}' 작업이 존재하지 않거나 만료되었습니다"}],
+            suggestions=["올바른 task_id인지 확인해주세요", "작업 결과는 24시간 후 자동 삭제됩니다"]
+        )
+
+    status = task_data.get("status")
+
+    if status == TaskStatus.COMPLETED:
+        return JSONResponse(
+            status_code=200,
+            content={
+                "meta": {
+                    "code": 200,
+                    "message": "분석 완료",
+                    "timestamp": datetime.now().isoformat()
+                },
+                "data": {
+                    "task_id": task_id,
+                    "status": TaskStatus.COMPLETED,
+                    "progress": 100,
+                    "result": task_data.get("result"),
+                }
+            }
+        )
+
+    elif status == TaskStatus.FAILED:
+        return JSONResponse(
+            status_code=200,
+            content={
+                "meta": {
+                    "code": 200,
+                    "message": "분석 실패",
+                    "timestamp": datetime.now().isoformat()
+                },
+                "data": {
+                    "task_id": task_id,
+                    "status": TaskStatus.FAILED,
+                    "progress": task_data.get("progress", 0),
+                    "error": task_data.get("error", "알 수 없는 오류"),
+                }
+            }
+        )
+
+    else:
+        # PENDING 또는 PROCESSING
+        return JSONResponse(
+            status_code=200,
+            content={
+                "meta": {
+                    "code": 200,
+                    "message": "분석 진행 중",
+                    "timestamp": datetime.now().isoformat()
+                },
+                "data": {
+                    "task_id": task_id,
+                    "status": status,
+                    "progress": task_data.get("progress", 0),
+                }
+            }
+        )
+
+
+# =============================================================================
+# 캐시 관리 API
+# =============================================================================
+@app.delete("/predict/cache/{cache_key}",
+            summary="특정 캐시 무효화",
+            description="캐시 키를 지정하여 해당 분석 결과 캐시를 삭제합니다.")
+async def delete_cache(cache_key: str):
+    success = await invalidate_cache(cache_key)
+    if success:
+        return {"meta": {"code": 200, "message": "캐시가 삭제되었습니다"}}
+    return create_error_response(
+        404,
+        "캐시를 찾을 수 없습니다",
+        [{"field": "cache_key", "message": "해당 캐시 키가 존재하지 않습니다"}]
+    )
+
+
+# =============================================================================
+# 백그라운드 작업: 실제 예측 수행
+# =============================================================================
+async def _run_prediction_task(
+        task_id: str,
+        address: str,
+        deposit: int,
+        ledger_paths: list,
+        registry_paths: list,
+        cache_key: str,
+        temp_dir: str,
+):
+    """
+    BackgroundTasks에서 실행되는 비동기 예측 파이프라인
+
+    진행 단계:
+    1. DB 연결 확인       (10%)
+    2. 건축물대장 OCR     (30%)
+    3. 등기부등본 OCR     (50%)
+    4. 문서 매칭 검증     (60%)
+    5. 위험도 예측        (90%)
+    6. 결과 저장 + 캐싱   (100%)
+    """
     try:
-        # OCR 처리 직전 DB 연결 재확인
-        print("[API] DB 연결 상태 확인 중...", flush=True)
+        # --- Step 1: DB 연결 확인 (10%) ---
+        await set_task_status(task_id, TaskStatus.PROCESSING, progress=10)
+
         if not is_db_available():
-            # 캐시 리셋 후 재확인
             reset_db_availability()
             if not check_db_connection():
-                return create_error_response(
-                    503,
-                    "서비스를 일시적으로 사용할 수 없습니다",
-                    [{
-                        "field": "database",
-                        "message": "데이터베이스 연결을 확인할 수 없습니다"
-                    }],
-                    suggestions=["잠시 후 다시 시도해주세요"]
+                await set_task_status(
+                    task_id, TaskStatus.FAILED,
+                    error="데이터베이스 연결을 확인할 수 없습니다. 잠시 후 다시 시도해주세요."
                 )
-        print("[API] DB 연결 확인 완료", flush=True)
-        # 1. 건축물대장 저장 및 분석
-        if ledger_files:
-            for file in ledger_files:
-                file_path = os.path.join(temp_dir, f"ledger_{datetime.now().timestamp()}_{file.filename}")
-                with open(file_path, "wb") as buffer:
-                    shutil.copyfileobj(file.file, buffer)
-                ledger_paths.append(file_path)
+                return
 
+        ocr_results = {'ledger': {}, 'registry': {}}
+
+        # --- Step 2: 건축물대장 OCR (30%) ---
+        await set_task_status(task_id, TaskStatus.PROCESSING, progress=20)
+        logger.info(f"[Task {task_id[:8]}] 건축물대장 OCR 시작...")
+
+        if ledger_paths:
             try:
-                ocr_results['ledger'] = extract_building_ledger(ledger_paths)
-            except Exception as e:
-                return create_error_response(
-                    422,
-                    "파일 분석 실패",
-                    [{
-                        "field": "ledger_files",
-                        "message": f"건축물대장 OCR 처리 실패: {str(e)}. 선명한 이미지를 업로드해주세요"
-                    }]
+                # OCR은 CPU 바운드 → 스레드풀에서 실행
+                ocr_results['ledger'] = await asyncio.to_thread(
+                    extract_building_ledger, ledger_paths
                 )
+            except Exception as e:
+                await set_task_status(
+                    task_id, TaskStatus.FAILED, progress=25,
+                    error=f"건축물대장 OCR 처리 실패: {str(e)}. 선명한 이미지를 업로드해주세요."
+                )
+                return
 
-        # 2. 등기부등본 저장 및 분석
-        if registry_files:
-            for file in registry_files:
-                file_path = os.path.join(temp_dir, f"registry_{datetime.now().timestamp()}_{file.filename}")
-                with open(file_path, "wb") as buffer:
-                    shutil.copyfileobj(file.file, buffer)
-                registry_paths.append(file_path)
+        await set_task_status(task_id, TaskStatus.PROCESSING, progress=40)
 
+        # --- Step 3: 등기부등본 OCR (50%) ---
+        logger.info(f"[Task {task_id[:8]}] 등기부등본 OCR 시작...")
+
+        if registry_paths:
             try:
-                ocr_results['registry'] = extract_real_estate_data(registry_paths)
+                ocr_results['registry'] = await asyncio.to_thread(
+                    extract_real_estate_data, registry_paths
+                )
             except Exception as e:
-                return create_error_response(
-                    422,
-                    "파일 분석 실패",
-                    [{
-                        "field": "registry_files",
-                        "message": f"등기부등본 OCR 처리 실패: {str(e)}. 선명한 PDF를 업로드해주세요"
-                    }]
+                await set_task_status(
+                    task_id, TaskStatus.FAILED, progress=45,
+                    error=f"등기부등본 OCR 처리 실패: {str(e)}. 선명한 PDF를 업로드해주세요."
                 )
+                return
 
-        # ================================================================
-        # 3. 문서 매칭 검증
-        # ================================================================
-        if ledger_files and registry_files:
-            ledger_data = ocr_results.get('ledger', {})
-            registry_data = ocr_results.get('registry', {})
+        await set_task_status(task_id, TaskStatus.PROCESSING, progress=60)
 
-            # 둘 다 유효한 데이터가 있을 때만 검증
-            if ledger_data and registry_data:
-                # 간편 함수 사용
-                is_valid, message, details = validate_document_match(
-                    ledger_data,
-                    registry_data
-                )
+        # --- Step 4: 문서 매칭 검증 (60%) ---
+        logger.info(f"[Task {task_id[:8]}] 문서 매칭 검증...")
 
-                if not is_valid:
-                    # 문서 불일치 에러 응답
-                    return create_error_response(
-                        status_code=422,
-                        message="문서 불일치 오류",
-                        errors=[{
-                            "field": "documents",
-                            "message": message,
-                            "details": {
-                                "confidence": f"{details['confidence']:.1%}",
-                                "issues": details['errors'],
-                                "match_scores": {
-                                    k: f"{v:.1%}"
-                                    for k, v in details['match_scores'].items()
-                                }
+        ledger_data = ocr_results.get('ledger', {})
+        registry_data = ocr_results.get('registry', {})
+
+        if ledger_data and registry_data:
+            is_valid, message, details = await asyncio.to_thread(
+                validate_document_match, ledger_data, registry_data
+            )
+
+            if not is_valid:
+                error_result = {
+                    "meta": {
+                        "code": 422,
+                        "message": "문서 불일치 오류",
+                        "timestamp": datetime.now().isoformat()
+                    },
+                    "errors": [{
+                        "field": "documents",
+                        "message": message,
+                        "details": {
+                            "confidence": f"{details['confidence']:.1%}",
+                            "issues": details['errors'],
+                            "match_scores": {
+                                k: f"{v:.1%}"
+                                for k, v in details['match_scores'].items()
                             }
-                        }],
-                        suggestions=[
-                            "건축물대장과 등기부등본이 같은 주소의 문서인지 확인해주세요",
-                            "호수(동/호)가 정확히 일치하는지 확인해주세요",
-                            "최신 문서를 사용하고 있는지 확인해주세요"
-                        ]
-                    )
+                        }
+                    }],
+                    "suggestions": [
+                        "건축물대장과 등기부등본이 같은 주소의 문서인지 확인해주세요",
+                        "호수(동/호)가 정확히 일치하는지 확인해주세요"
+                    ]
+                }
+                await set_task_status(
+                    task_id, TaskStatus.FAILED, progress=60,
+                    error=message, result=error_result
+                )
+                return
 
-                # 경고가 있으면 로그 기록 (검증은 통과)
-                if details.get('warnings'):
-                    print(f"[문서검증 경고] {details['warnings']}", flush=True)
+            if details.get('warnings'):
+                logger.warning(f"[문서검증 경고] {details['warnings']}")
 
-        # 4. 예측 실행
-        print(f"[API] 예측 시작 - 주소: {address}, 보증금: {deposit}만원", flush=True)
-        result = predict_risk_with_ocr(address, deposit, ocr_results)
-        print("[API] 예측 완료", flush=True)
+        await set_task_status(task_id, TaskStatus.PROCESSING, progress=75)
 
-        return result
+        # --- Step 5: 위험도 예측 (90%) ---
+        logger.info(f"[Task {task_id[:8]}] 위험도 예측 시작...")
+
+        result = await asyncio.to_thread(
+            predict_risk_with_ocr, address, deposit, ocr_results
+        )
+
+        await set_task_status(task_id, TaskStatus.PROCESSING, progress=95)
+
+        # --- Step 6: 결과 캐싱 + 완료 (100%) ---
+        logger.info(f"[Task {task_id[:8]}] 결과 캐싱...")
+
+        # 성공 결과만 캐싱 (에러 응답은 캐싱하지 않음)
+        if "meta" in result and result["meta"].get("code") == 200:
+            await set_cached_result(cache_key, result)
+
+        await set_task_status(
+            task_id, TaskStatus.COMPLETED,
+            progress=100, result=result
+        )
+        logger.info(f"✅ [Task {task_id[:8]}] 분석 완료")
+
     except DatabaseConnectionError as e:
-        # DB 연결 오류 - 명확한 500 에러 반환
-        print(f"[에러] 데이터베이스 연결 실패: {e}", flush=True)
-
-        return create_error_response(
-            500,
-            "서버 오류가 발생했습니다",
-            [{
-                "field": "server",
-                "message": f"분석 실패: {str(e)}"
-            }]
+        logger.error(f"[Task {task_id[:8]}] DB 연결 실패: {e}")
+        await set_task_status(
+            task_id, TaskStatus.FAILED,
+            error=f"분석 실패: {str(e)}"
         )
 
     except ServiceUnavailableError as e:
-        # 서비스 사용 불가 오류
-        print(f"[에러] 서비스 사용 불가: {e}", flush=True)
-
-        return create_error_response(
-            503,
-            "서비스를 일시적으로 사용할 수 없습니다",
-            [{
-                "field": "service",
-                "message": str(e)
-            }]
+        logger.error(f"[Task {task_id[:8]}] 서비스 불가: {e}")
+        await set_task_status(
+            task_id, TaskStatus.FAILED,
+            error=f"서비스를 일시적으로 사용할 수 없습니다: {str(e)}"
         )
-    except Exception as e:
-        print(f"[에러] 예측 중 오류: {e}", flush=True)
-        import traceback
-        traceback.print_exc()
 
-        # 연결 관련 오류 메시지 확인
+    except Exception as e:
+        logger.exception(f"[Task {task_id[:8]}] 예측 중 오류: {e}")
         error_msg = str(e)
 
         if "Can't connect" in error_msg or "Connection refused" in error_msg:
-            return create_error_response(
-                500,
-                "서버 오류가 발생했습니다",
-                [{
-                    "field": "server",
-                    "message": "분석 실패: Database connection failed"
-                }]
-            )
+            error_msg = "Database connection failed"
 
-        return create_error_response(
-            500,
-            "서버 오류가 발생했습니다",
-            [{
-                "field": "server",
-                "message": f"분석 실패: {str(e)}"
-            }]
+        await set_task_status(
+            task_id, TaskStatus.FAILED,
+            error=f"분석 실패: {error_msg}"
         )
 
     finally:
         # 임시 파일 정리
-        for path in ledger_paths + registry_paths:
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except Exception as e:
-                    print(f"[Warning] 임시 파일 삭제 실패: {path} - {e}")
+        _cleanup_temp_files(ledger_paths + registry_paths, temp_dir)
+
+
+def _cleanup_temp_files(file_paths: list, temp_dir: str):
+    """임시 파일 및 디렉토리 정리"""
+    for path in file_paths:
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+            except Exception as e:
+                logger.warning(f"임시 파일 삭제 실패: {path} - {e}")
+
+    if temp_dir and os.path.exists(temp_dir):
+        try:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        except Exception as e:
+            logger.warning(f"임시 디렉토리 삭제 실패: {temp_dir} - {e}")
 
 
 if __name__ == "__main__":
     import uvicorn
-    # 로컬 개발용 실행 커맨드: python app/main.py
+
     uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)

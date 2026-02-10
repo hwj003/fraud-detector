@@ -11,7 +11,7 @@ class Settings(BaseSettings):
     DB_HOST: str
     DB_PORT: str
     DB_NAME: str
-
+    REDIS_URL: str
     # 연결 타임아웃 설정 (초)
     DB_CONNECT_TIMEOUT: int = 5
     DB_READ_TIMEOUT: int = 30

@@ -144,6 +144,7 @@ def train_and_save_model():
         n_estimators=200,  # 트리 개수 늘림
         max_depth=10,
         min_samples_leaf=2,  # 과적합 방지
+        class_weight='balanced',
         random_state=42,
         n_jobs=-1
     )
